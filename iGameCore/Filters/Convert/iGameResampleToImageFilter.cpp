@@ -10,6 +10,7 @@
 #include "iGameStructuredMesh.h"
 #include "iGameUnstructuredMesh.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
@@ -421,6 +422,15 @@ bool ResampleToImageFilter::Execute() {
         outCellArrays[s]->Resize(numberOfGridPoints);
     }
 
+    // 插值/快照缓冲区按属性最大分量数动态分配，避免固定 16 分量的越界风险。
+    int maxDim = 1;
+    for (size_t s = 0; s < srcPointArrays.size(); ++s) {
+        maxDim = std::max(maxDim, srcPointArrays[s].dim);
+    }
+    for (size_t q = 0; q < snappedCellIndices.size(); ++q) {
+        maxDim = std::max(maxDim, srcCellArrays[snappedCellIndices[q]].dim);
+    }
+
     // 源单元 ghost 标记（若存在 "vtkGhostType" 单元属性），探测时跳过 ghost 单元。
     std::vector<unsigned char> srcGhostFlags(numberOfCells, 0);
     {
@@ -460,7 +470,7 @@ bool ResampleToImageFilter::Execute() {
 
     // 对每个源单元，在其包围盒覆盖的格点范围内做探针插值
     // （等价 vtkProbeFilter::ProbeImagePointsInCell：单元定向遍历，而非格点定向）。
-    double vals[16];
+    std::vector<double> vals(static_cast<size_t>(maxDim));
     double pts[8][3];
     double weights[8];
     for (IGsize cid = 0; cid < numberOfCells; ++cid) {
@@ -525,7 +535,7 @@ bool ResampleToImageFilter::Execute() {
                                 vals[d] += wv * srcPointArrays[s].arr->GetElementValue(ids[v], d);
                             }
                         }
-                        outPointArrays[s]->SetElement(ptId, vals);
+                        outPointArrays[s]->SetElement(ptId, vals.data());
                     }
                     // 快照源单元属性（该点所在源单元的 cell data）
                     for (size_t q = 0; q < snappedCellIndices.size(); ++q) {
@@ -533,7 +543,7 @@ bool ResampleToImageFilter::Execute() {
                         for (int d = 0; d < ca.dim; ++d) {
                             vals[d] = ca.arr->GetElementValue(cid, d);
                         }
-                        outCellArrays[q]->SetElement(ptId, vals);
+                        outCellArrays[q]->SetElement(ptId, vals.data());
                     }
                 }
             }

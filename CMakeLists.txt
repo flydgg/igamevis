@@ -184,28 +184,6 @@ if (ENABLE_QT_MODULE)
     endif ()
 endif ()
 
-# 单独编译「点集转八叉树」自检测试（console 程序，无 HDF5 / Qt / 窗口依赖）。
-# 它直连锁定 iGameCore，不经过需要 find_package(HDF5) 的 Examples 工程，
-# 便于在 VS 中把它设为启动项后直接 F5 / Ctrl+F5 运行。默认开启，不需要时关掉即可。
-option(IGAME_BUILD_TEST_POINTSET_TO_OCTREE "Build the PointSetToOctree self-test executable." ON)
-if (IGAME_BUILD_TEST_POINTSET_TO_OCTREE)
-    add_executable(testPointSetToOctree
-            Examples/Filter/Convert/TestPointSetToOctree.cpp)
-    target_link_libraries(testPointSetToOctree PRIVATE iGameCore)
-    target_compile_definitions(testPointSetToOctree PRIVATE
-            IGAME_PLATFORM_WINDOWS PLATFORM_WINDOWS IGAME_OPENGL_VERSION_460)
-endif ()
-
-# 单独编译「重采样到图像」自检测试（console 程序，无 HDF5 / Qt / 窗口依赖）。
-option(IGAME_BUILD_TEST_RESAMPLE_TO_IMAGE "Build the ResampleToImage self-test executable." ON)
-if (IGAME_BUILD_TEST_RESAMPLE_TO_IMAGE)
-    add_executable(testResampleToImage
-            Examples/Filter/Convert/TestResampleToImage.cpp)
-    target_link_libraries(testResampleToImage PRIVATE iGameCore)
-    target_compile_definitions(testResampleToImage PRIVATE
-            IGAME_PLATFORM_WINDOWS PLATFORM_WINDOWS IGAME_OPENGL_VERSION_460)
-endif ()
-
 # 导入example
 if (EXAMPLE_COMPILE)
     add_subdirectory(Examples)
