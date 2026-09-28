@@ -40,7 +40,7 @@ endif ()
 # Set Core Module install Option to ON
 #--------------------------------------------------------------------
 set(CORE_MODULE_INSTALL ON CACHE BOOL "Enable iGameVis Core Module to install as lib or not." FORCE)
-option(EXAMPLE_COMPILE "Enable iGameVis Core Module's Example Compilation." OFF)
+option(EXAMPLE_COMPILE "Enable iGameVis Core Module's Example Compilation." ON)
 set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "Install path prefix" FORCE)
 
 # 如果检测到 Anaconda 环境，尝试忽略其路径

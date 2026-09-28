@@ -40,6 +40,7 @@
 #include <IQWidgets/igQtAiChat/igQtAiChatWidget.h>
 #include <IQWidgets/igQtAiChat/igQtCommandManager.h>
 #include <IQWidgets/igQtCharts.h>
+#include <IQWidgets/igQtInterpolationFitWidget.h>
 #include <IQWidgets/igQtDeformationWidget.h>
 #include <IQWidgets/igQtModelClipWidget.h>
 #include <IQWidgets/igQtModelDrawWidget.h>
@@ -105,7 +106,7 @@
 #include <QFormLayout>
 #include <QDialogButtonBox>
 
-
+#include "games102/hw1.h"
 #include "ui_igQtVariableCorrelationWidget.h"
 
 namespace {
@@ -1943,6 +1944,16 @@ void igQtMainWindow::initAllFilters() {
             res->SetName(data->GetName());
             modelTreeWidget->addDataObjectToModelTree(res, Algorithm);
         }
+    });
+
+    QAction* hw1 = ui->menu_filters->addAction(
+            QStringLiteral("插值型拟合函数图像 (HW1 Interpolation Fit)"));
+    connect(hw1, &QAction::triggered, this, [&](bool checked) { 
+        // games102 HW1：交互式插值型拟合函数图像
+        // 左键空白处新增控制点 / 左键拖动控制点 / 右键点删除 / 右键空白切换多项式与样条 / 滚轮缩放
+        auto* plotWidget = new igQtInterpolationFitWidget(this);
+        plotWidget->setAttribute(Qt::WA_DeleteOnClose);
+        plotWidget->show();
     });
 }
 
