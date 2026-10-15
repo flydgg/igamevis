@@ -49,7 +49,8 @@ IGAME_NAMESPACE_BEGIN
  *   QuadraticXxx::EvaluatePosition 求值，内核不再重写形函数。
  *
  * 尚未实现插值的类型（18 节点双二次-二次楔形、24 节点双二次-二次六面体、19 节点三二次金字塔、
- * 含棱中点的 QuadraticPolygon、Lagrange* 任意阶）由内核退化为「前 N 个角点」的线性单元，
+ * 含棱中点的 QuadraticPolygon、Lagrange 金字塔——VTK 本身亦为 Not Implemented 占位）
+ * 由内核退化为「前 N 个角点」的线性单元，
  * 数量见 GetUnsupportedQuadraticCellCount() 与 GetMessage() 中的 degraded cells=N。
  *
  * 采样点不在任何单元内（超出容差）时标记为无效：输出点数据属性 validpointmask

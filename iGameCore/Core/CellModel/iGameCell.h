@@ -480,6 +480,117 @@ public:
 		bindex[kFaceMinCoord[faceId]] = minV;
 	}
 
+	/** 楔形（三棱柱）：三角形面内的自由度偏移，等价 vtkHigherOrderWedge 里的 triangleDOFOffset */
+	static int WedgeTriangleDOFOffset(int order, int i, int j) {
+		return i + order * (j - 1) - (j * (j + 1)) / 2;
+	}
+
+	/**
+	 * 楔形（三棱柱）节点索引：等价 vtkHigherOrderWedge::PointIndexFromIJK
+	 * （节点序：6 顶点 → 9 棱内部点 → 3 四边形面内部点 → 体内部点，与仓库 GetEdgePointIds 表一致）。
+	 */
+	static int WedgePointIndexFromIJK(int i, int j, int k, int rsOrder, int tOrder) {
+		const int rm1 = rsOrder - 1;
+		const int tm1 = tOrder - 1;
+		const bool ibdy = (i == 0);
+		const bool jbdy = (j == 0);
+		const bool ijbdy = (i + j == rsOrder);
+		const bool kbdy = (k == 0 || k == tOrder);
+		const int nbdy = (ibdy ? 1 : 0) + (jbdy ? 1 : 0) + (ijbdy ? 1 : 0) + (kbdy ? 1 : 0);
+
+		if (i < 0 || i > rsOrder || j < 0 || j > rsOrder || i + j > rsOrder || k < 0 || k > tOrder) {
+			return -1;
+		}
+		if (nbdy == 3) { // 顶点
+			return (ibdy && jbdy ? 0 : (jbdy && ijbdy ? 1 : 2)) + (k ? 3 : 0);
+		}
+
+		int offset = 6;
+		if (nbdy == 2) { // 棱
+			if (!kbdy) { // 竖直棱
+				offset += rm1 * 6;
+				return offset + (k - 1) + ((ibdy && jbdy) ? 0 : (jbdy && ijbdy ? 1 : 2)) * tm1;
+			}
+			// 水平棱
+			offset += (k == tOrder ? 3 * rm1 : 0);
+			if (jbdy) { return offset + i - 1; }
+			offset += rm1;
+			if (ijbdy) { return offset + j - 1; }
+			offset += rm1;
+			return offset + (rsOrder - j - 1);
+		}
+
+		offset += 6 * rm1 + 3 * tm1; // 跳过全部棱
+		const int ntfdof = (rm1 - 1) * rm1 / 2; // 三角形面内部点数
+		const int nqfdof = rm1 * tm1;           // 四边形面内部点数
+		if (nbdy == 1) { // 面
+			if (kbdy) { // 三角形面
+				if (k > 0) { offset += ntfdof; }
+				return offset + WedgeTriangleDOFOffset(rsOrder, i, j);
+			}
+			offset += 2 * ntfdof;
+			if (jbdy) { return offset + (i - 1) + rm1 * (k - 1); }
+			offset += nqfdof;
+			if (ijbdy) { return offset + (j - 1) + rm1 * (k - 1); }
+			offset += nqfdof;
+			return offset + (rsOrder - j - 1) + rm1 * (k - 1);
+		}
+
+		offset += 2 * ntfdof + 3 * nqfdof; // 跳过全部面
+		return offset + WedgeTriangleDOFOffset(rsOrder, i, j) + ntfdof * (k - 1); // 体内部
+	}
+
+	/**
+	 * 楔形形函数与导数：等价 vtkHigherOrderWedge 的 WedgeShapeFunctions/WedgeShapeDerivatives
+	 * 通用路径——三角形方向用 Silvester（Eta/Deta，重心指数即 (i, j, p-i-j)），
+	 * 轴向用等距 1D Lagrange（自然索引）。导数布局 [∂N/∂r ×n, ∂N/∂s ×n, ∂N/∂t ×n]。
+	 */
+	static int LagrangeWedgeShapeDerivs(int rsOrder, int tOrder, double r, double s, double t,
+	                                    double* shape, double* derivs) {
+		if (rsOrder < 1 || rsOrder > 9 || tOrder < 1 || tOrder > 9) { return 0; }
+		const int p = rsOrder;
+		const int q = tOrder;
+		const int nTri = (p + 1) * (p + 2) / 2;
+		const int n = nTri * (q + 1);
+		double psi[16], dpsi[16];
+		LagrangeShapeAndGradient1D(q, t, psi, dpsi);
+		const double tau[3] = {r, s, 1.0 - r - s};
+
+		for (int idx = 0; idx < n; ++idx) {
+			shape[idx] = 0.0;
+			if (derivs != nullptr) { derivs[idx] = derivs[n + idx] = derivs[2 * n + idx] = 0.0; }
+		}
+		for (int kk = 0; kk <= q; ++kk) {
+			for (int jj = 0; jj <= p; ++jj) {
+				for (int ii = 0; ii <= p - jj; ++ii) {
+					const int sn = WedgePointIndexFromIJK(ii, jj, kk, p, q);
+					if (sn < 0 || sn >= n) { continue; }
+					const int l0 = ii, l1 = jj, l2 = p - ii - jj;
+					const double ea = SimplexEta(p, l0, tau[0]);
+					const double eb = SimplexEta(p, l1, tau[1]);
+					const double ec = SimplexEta(p, l2, tau[2]);
+					shape[sn] = psi[kk] * ea * eb * ec;
+					if (derivs == nullptr) { continue; }
+					const double da = SimplexDeta(p, l0, tau[0]);
+					const double db = SimplexDeta(p, l1, tau[1]);
+					const double dc = SimplexDeta(p, l2, tau[2]);
+					derivs[sn] = psi[kk] * (da * eb * ec - ea * eb * dc);
+					derivs[n + sn] = psi[kk] * (ea * db * ec - ea * eb * dc);
+					derivs[2 * n + sn] = dpsi[kk] * ea * eb * ec;
+				}
+			}
+		}
+		return n;
+	}
+
+	/** 楔形：由点数反推阶数（n = (p+1)(p+2)/2 × (p+1)） */
+	static int WedgeOrderFromPointCount(int n) {
+		for (int p = 1; p <= 9; ++p) {
+			if (((p + 1) * (p + 2) / 2) * (p + 1) == n) { return p; }
+		}
+		return -1;
+	}
+
 	/** 四面体：由点数反推阶数（n = (p+1)(p+2)(p+3)/6） */
 	static int TetraOrderFromPointCount(int n) {
 		for (int p = 1; p <= 10; ++p) {

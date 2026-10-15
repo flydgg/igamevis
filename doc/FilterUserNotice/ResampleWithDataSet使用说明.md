@@ -39,7 +39,10 @@
   `Hexahedron` / `Prism` / `Pyramid` / `Polyhedron`；
 - 二次：`QuadraticTriangle` / `QuadraticQuad` / `QuadraticTetra` / `QuadraticHexahedron` /
   `QuadraticPrism`(15) / `QuadraticPyramid`(13)；
-- 尚未实现插值的类型（部分高阶 / `Lagrange*`）：退化为「前 N 个角点」的线性单元，
+- `Lagrange`：`LagrangeLine` / `LagrangeTriangle` / `LagrangeQuadrilateral` /
+  `LagrangeTetrahedron` / `LagrangeHexahedron` / `LagrangePrism`（对照 `vtkLagrange*` /
+  `vtkHigherOrder*`，等距节点 + 张量积 / Silvester 基）；
+- 尚未实现插值的类型（18 / 24 / 19 节点高阶、含棱中点的 `QuadraticPolygon`、`Lagrange` 金字塔——VTK 中亦为占位）：退化为「前 N 个角点」的线性单元，
   并在 `GetMessage()` 中给出 `degraded cells=N`。
 
 ## 主要接口
@@ -173,7 +176,7 @@ Examples/Filter/TestResampleWithDataSet.cpp
 4. 手动容差是**相对值**（乘包围盒对角线），要拿实际使用的绝对长度请用 `GetEffectiveTolerance()`；吸附半径同理（`GetEffectiveSnappingRadius()`）。
 5. 吸附半径默认关闭，且**没有在面板中暴露**，只提供 API；开启后不会移动采样点坐标。
 6. 「被采样网格」不限类型：`PointSet`（每点一个顶点单元）/ `SurfaceMesh` / `VolumeMesh` / `UnstructuredMesh` / `StructuredMesh`（按 `(ni,nj,nk)` 生成 `QUAD` / `HEXAHEDRON`）/ `LagrangeUnstructuredMesh` 都会先归一化为一份 `UnstructuredMesh` 再参与定位与插值；容器网格（`DrawObject` / `CompositeDataObject` / 带子数据对象的多帧时间序列、多 zone 文件）会递归展开所有块并**合并成一份网格**（等价先做 Merge Blocks）。单块输入不做拷贝，几何与属性与原对象共享；不支持的类型会在 `GetMessage()` 中给出数据类型名与可支持的类型列表。
-7. 尚未实现插值的类型（部分高阶 / `Lagrange*`）会退化为角点线性处理：非线性的高阶场在这些单元上不再精确，注意 `GetUnsupportedQuadraticCellCount()` 与消息提示。
+7. 尚未实现插值的类型（18 / 24 / 19 节点高阶、含棱中点的 `QuadraticPolygon`、`Lagrange` 金字塔）会退化为角点线性处理：非线性的高阶场在这些单元上不再精确，注意 `GetUnsupportedQuadraticCellCount()` 与消息提示。
 8. 采样点网格自身的数组**不会**被复制到输出（与 `vtkProbeFilter` 默认的 `PassPointArrays` / `PassCellArrays` 一致）；若确实需要这些数组，请自行用其它滤波器处理。
 9. `Execute()` 失败时 `GetOutput(0)` 为 `nullptr`，失败原因从 `GetMessage()` 获取（例如「未选择「被采样网格」」「「采样点网格」没有点，无法确定采样位置」）。
 10. 定位走内核的 CSR 空间索引（按被采样网格包围盒与单元数自动划分），采样点很多（≥1024）时自动按线程并行且结果与串行逐位一致；一次执行的采样点数等于「采样点网格」的点数。

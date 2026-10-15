@@ -58,7 +58,8 @@
 2. 二次：`QuadraticTriangle` / `QuadraticQuad` / `QuadraticTetra` / `QuadraticHexahedron` /
    `QuadraticPrism`(15 节点, `vtkQuadraticWedge`) / `QuadraticPyramid`(13 节点)；
 3. 尚未实现插值的类型（18 节点双二次-二次楔形、24 节点双二次-二次六面体、19 节点三二次金字塔、
-   含棱中点的 `QuadraticPolygon`、任意阶 `Lagrange*`）：内核退化为**前 N 个角点**的线性单元，
+   含棱中点的 `QuadraticPolygon`、`Lagrange` 金字塔——VTK 中亦为 `Not Implemented yet` 占位）：
+   内核退化为**前 N 个角点**的线性单元，
    数量由 `GetUnsupportedQuadraticCellCount()` 与 `GetMessage()`（`degraded cells=N`）提示。
 
 ## 主要接口
