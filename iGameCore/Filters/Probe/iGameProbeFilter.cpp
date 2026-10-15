@@ -390,6 +390,26 @@ Cell* MakeCellForType(IGenum type) {
  * 原生类型或可退化为角点线性的类型都用内核自己的每线程单元对象，其余（PolyLine / Polyhedron 等）
  * 只能走 mesh->GetCell()。
  */
+/** 采样点并行的最小样本数（与定位一致的阈值） */
+constexpr IGsize kSampleParallelThreshold = 1024;
+
+/**
+ * 采样点按块并行：走线程池的任务队列（而不是每个分块起一个裸线程），
+ * 并且分块数取「工作线程数 × 4」，让先完成的线程继续取后面的块 → 命中分布不均时也能均衡。
+ */
+template<typename Func>
+void ParallelChunks(int sampleCount, Func&& process) {
+    if (sampleCount <= 0) { return; }
+    const int workers = std::max(1, ThreadPool::GetDefaultThreadCount());
+    const int chunks = std::max(1, std::min(sampleCount, workers * 4));
+    if (chunks <= 1) {
+        process(0, sampleCount);
+        return;
+    }
+    ThreadPool::parallelFor(0, sampleCount,
+                            [&](int begin, int end) { process(begin, end); }, chunks);
+}
+
 bool RequiresMeshCell(IGenum type) {
     if (NativeCellForType(type) != nullptr) { return false; }
     const IGenum linear = LinearTypeFor(type);
@@ -1224,18 +1244,13 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
 
     // 单位置循环；样本多且源网格可并行时按线程分块（每块独立 scratch，写 out 的互不相交下标）
     const size_t sampleCount = positions.size();
-    constexpr size_t kParallelThreshold = 1024;
-    const bool parallel = options.useParallel && !unsafeForParallel && sampleCount >= kParallelThreshold;
+    const bool parallel = options.useParallel && !unsafeForParallel &&
+                          sampleCount >= static_cast<size_t>(kSampleParallelThreshold);
     if (parallel) {
-        const int maxThreads = std::max(1, ThreadPool::GetDefaultThreadCount());
-        ThreadPool::parallelFor(0, static_cast<int>(sampleCount), maxThreads,
-                                [&](int begin, int end, int id) {
-                                    LocateScratch scratch;
-                                    (void) id;
-                                    for (int k = begin; k < end; ++k) {
-                                        locateOne(static_cast<size_t>(k), scratch);
-                                    }
-                                });
+        ParallelChunks(static_cast<int>(sampleCount), [&](int begin, int end) {
+            LocateScratch scratch;
+            for (int k = begin; k < end; ++k) { locateOne(static_cast<size_t>(k), scratch); }
+        });
     } else {
         LocateScratch scratch;
         for (size_t i = 0; i < sampleCount; ++i) { locateOne(i, scratch); }
@@ -1282,10 +1297,10 @@ void ProbeFilter::InterpolateAttributes(const UnstructuredMesh::Pointer& mesh,
             outs.push_back({attr.pointer, dst, dim});
         }
 
-        // 采样点外层、数组内层：每个采样点只取一次命中单元（等价 VTK worklet 的做法）
-        std::vector<double> values;
-        std::vector<double> raw;
-        for (int j = 0; j < sampleNum; ++j) {
+        // 采样点外层、数组内层：每个采样点只取一次命中单元（等价 VTK worklet 的做法）。
+        // 与定位同样并行：每线程独立缓冲、写 out 的互不相交下标；数组 SetElement 只写自身缓冲区，
+        // 无共享状态。源网格含"只能用共享单元对象"的类型（PolyLine/Polyhedron）时退回串行。
+        const auto interpolateOne = [&](int j, std::vector<double>& values, std::vector<double>& raw) {
             const SampleLocation& loc = locations[static_cast<size_t>(j)];
             // 与定位阶段用同一个 KernelCellFor：退化单元（EmptyCell → 角点线性）也能拿到正确的全局点 id
             int npts = 0;
@@ -1307,6 +1322,27 @@ void ProbeFilter::InterpolateAttributes(const UnstructuredMesh::Pointer& mesh,
                 }
                 out.dst->SetElement(static_cast<IGsize>(j), values.data());
             }
+        };
+
+        bool unsafeForParallel = false;
+        if (options.useParallel && sampleNum >= static_cast<int>(kSampleParallelThreshold)) {
+            const IGsize cellCount = mesh->GetNumberOfCells();
+            for (IGsize cid = 0; cid < cellCount && !unsafeForParallel; ++cid) {
+                unsafeForParallel = RequiresMeshCell(mesh->GetCellType(cid));
+            }
+        }
+        const bool parallel = options.useParallel && !unsafeForParallel &&
+                              sampleNum >= static_cast<int>(kSampleParallelThreshold);
+        if (parallel) {
+            ParallelChunks(sampleNum, [&](int begin, int end) {
+                std::vector<double> values;
+                std::vector<double> raw;
+                for (int j = begin; j < end; ++j) { interpolateOne(j, values, raw); }
+            });
+        } else {
+            std::vector<double> values;
+            std::vector<double> raw;
+            for (int j = 0; j < sampleNum; ++j) { interpolateOne(j, values, raw); }
         }
     }
 
