@@ -441,6 +441,39 @@ void FillKernelCell(Cell* cell, const UnstructuredMesh::Pointer& mesh, const igI
  * 权重与全局点 id 一一对应。
  */
 Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& nptsOut, bool* degraded) {
+    // 「上次填充好的单元」缓存：同一线程连续/重复请求同一个单元时直接复用，避免
+    // Reset()+AddPoint() 重填与 GetCellPointIds 的拷贝。定位与随后的一次插值通常命中
+    // 同一个单元，命中率很高。键包含 mesh 地址与 MTime，网格被修改后自动失效。
+    struct FilledCell {
+        const void* meshKey{nullptr};
+        unsigned int meshMTime{0};
+        igIndex cellId{-1};
+        IGenum type{IG_NONE};
+        Cell* cell{nullptr};
+        int numPoints{0};
+        bool degraded{false};
+    };
+    thread_local FilledCell s_filled;
+
+    const void* meshKey = static_cast<const void*>(mesh.GetPointer());
+    const unsigned int meshMTime = mesh->GetMTime();
+    if (s_filled.cell != nullptr && s_filled.cellId == cellId && s_filled.meshKey == meshKey &&
+        s_filled.meshMTime == meshMTime && s_filled.type == mesh->GetCellType(cellId)) {
+        nptsOut = s_filled.numPoints;
+        if (degraded != nullptr) { *degraded = s_filled.degraded; }
+        return s_filled.cell;
+    }
+    const auto remember = [&](Cell* cell, int numPoints, bool isDegraded) {
+        s_filled.meshKey = meshKey;
+        s_filled.meshMTime = meshMTime;
+        s_filled.cellId = cellId;
+        s_filled.type = mesh->GetCellType(cellId);
+        s_filled.cell = cell;
+        s_filled.numPoints = numPoints;
+        s_filled.degraded = isDegraded;
+        return cell;
+    };
+
     if (degraded != nullptr) { *degraded = false; }
     igIndex ptIds[IGAME_CELL_MAX_SIZE];
     const int npts = mesh->GetCellPointIds(cellId, ptIds);
@@ -455,7 +488,7 @@ Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& 
         if (need > 0 && need <= npts) {
             FillKernelCell(native, mesh, ptIds, need);
             nptsOut = need;
-            return native;
+            return remember(native, need, false);
         }
     }
 
@@ -464,12 +497,12 @@ Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& 
         thread_local PolyLine::Pointer s_polyLine = PolyLine::New();
         FillKernelCell(s_polyLine.GetPointer(), mesh, ptIds, npts);
         nptsOut = npts;
-        return s_polyLine.GetPointer();
+        return remember(s_polyLine.GetPointer(), npts, false);
     }
 
     // 3) 需要面拓扑的类型（Polyhedron）：沿用 mesh 内部构造好的单元对象
     if (Cell* meshCell = mesh->GetCell(cellId); meshCell != nullptr && meshCell->GetCellType() != IG_EMPTY_CELL) {
-        return meshCell;
+        return remember(meshCell, npts, false);
     }
 
     // 4) 退化：前 N 个角点的线性单元
@@ -483,7 +516,7 @@ Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& 
     FillKernelCell(fallback, mesh, ptIds, corners);
     nptsOut = corners;
     if (degraded != nullptr) { *degraded = true; }
-    return fallback;
+    return remember(fallback, corners, true);
 }
 
 int EvaluateCellAt(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p,
