@@ -600,18 +600,29 @@ void DrawObject::SetRenderableObject(DataObject::Pointer dataObject) {
     m_RenderableMesh.SimplifiedMesh = nullptr;
 #ifndef __EMSCRIPTEN__
     constexpr IGsize maxAutomaticLodFaces = 20000000;
-    // 自动交互 LOD 用的是二次误差简化（MeshSimplificationFilterPro），成本随面数增长很快：
-    // 200 万面级网格在显示路径上同步简化会卡住数分钟（首帧一直不出现）。因此只在
-    // 能“秒级完成”的规模内自动构建，更大的网格先直接显示全分辨率（SetAutoBuildInteractionLod
-    // 仍可显式开启；后续可改为后台线程构建后再替换）。
-    constexpr IGsize synchronousLodFaceLimit = 1000000;
+    // 自动交互 LOD：现在用 O(n) 的聚类抽稀（见 BuildSimplifiedRenderableObject），
+    // 百万面级网格只需几十~几百毫秒，因此可以在显示路径上同步构建；超大网格
+    // （超过 maxAutomaticLodFaces）跳过，避免不可控的等待，直接显示全分辨率。
+    constexpr IGsize automaticLodFaceThreshold = 1000000;
     auto surfaceMesh = DynamicCast<SurfaceMesh>(dataObject);
     if (m_AutoBuildInteractionLod && m_ShellRendering && surfaceMesh != nullptr &&
-        surfaceMesh->GetNumberOfFaces() > synchronousLodFaceLimit) {
-        IGAME_RENDERING_INFO(
-                "{}: automatic interaction LOD skipped on the display path for {} faces (> {}); "
-                "showing the full-resolution mesh instead.",
-                surfaceMesh->GetName(), surfaceMesh->GetNumberOfFaces(), synchronousLodFaceLimit);
+        surfaceMesh->GetNumberOfFaces() > automaticLodFaceThreshold) {
+        if (surfaceMesh->GetNumberOfFaces() <= maxAutomaticLodFaces) {
+            const auto lodStart = std::chrono::steady_clock::now();
+            const IGsize sourceFaces = surfaceMesh->GetNumberOfFaces();
+            BuildSimplifiedRenderableObject();
+            const double lodMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - lodStart).count();
+            auto lodMesh = DynamicCast<SurfaceMesh>(m_RenderableMesh.SimplifiedMesh);
+            const IGsize lodFaces = lodMesh.IsNull() ? 0 : lodMesh->GetNumberOfFaces();
+            IGAME_RENDERING_INFO("{}: automatic interaction LOD built with vertex clustering "
+                                 "({} -> {} faces) in {} ms.",
+                                 surfaceMesh->GetName(), sourceFaces, lodFaces, lodMs);
+        } else {
+            IGAME_RENDERING_INFO("{}: automatic interaction LOD skipped for {} faces (limit {}); "
+                                 "interaction retains the full-resolution mesh.",
+                                 surfaceMesh->GetName(), surfaceMesh->GetNumberOfFaces(), maxAutomaticLodFaces);
+        }
     }
 #endif
 
@@ -655,10 +666,14 @@ void DrawObject::BuildSimplifiedRenderableObject() {
     auto simplifiedMesh = sourceMesh;
     MeshSimplificationFilterPro::Pointer meshSimplifier = MeshSimplificationFilterPro::New();
     meshSimplifier->SetInput(sourceMesh);
+    // 交互期低模用“规则网格顶点聚类”而不是边收缩二次误差简化：后者在 200 万面级
+    // 网格上要数分钟，会把显示路径卡死；聚类是 O(n)，同一网格只需几十~几百毫秒。
+    meshSimplifier->SetUseClustering(true);
+    meshSimplifier->SetClusterResolution(m_InteractionLodResolution);
     meshSimplifier->SetPreserveBoundary(true);
     meshSimplifier->SetFreeze(false);
     meshSimplifier->SetTransformToCellData(false);
-    meshSimplifier->SetTargetReduction(0.2);
+    meshSimplifier->SetTargetReduction(m_InteractionLodReduction);
     if (meshSimplifier->Execute()) {
         auto outputMesh = DynamicCast<DrawObject>(meshSimplifier->GetOutput());
         if (outputMesh != nullptr) { simplifiedMesh = outputMesh; }

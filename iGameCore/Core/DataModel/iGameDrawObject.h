@@ -3,6 +3,8 @@
 #include <array>
 
 #include "iGameClipper.h"
+#include <algorithm>
+
 #include "iGameDataObject.h"
 #include "iGameIdArray.h"
 #include "iGameMarker.h"
@@ -137,6 +139,14 @@ public:
     void SetRenderableObject(DataObject::Pointer dataObject);
     DrawObject::Pointer GetRenderableObject(bool useSimplified = false);
     void SetAutoBuildInteractionLod(bool enabled);
+    // 交互期低模（聚类抽稀）参数：reduction 为目标点数比例 [0,1]；
+    // resolution > 0 时直接指定聚类网格分辨率（对应 ParaView 的 LOD resolution）。
+    void SetInteractionLodReduction(float reduction) {
+        m_InteractionLodReduction = std::min(1.0f, std::max(0.01f, reduction));
+    }
+    float GetInteractionLodReduction() const { return m_InteractionLodReduction; }
+    void SetInteractionLodResolution(int resolution) { m_InteractionLodResolution = resolution < 0 ? 0 : resolution; }
+    int GetInteractionLodResolution() const { return m_InteractionLodResolution; }
     bool GetAutoBuildInteractionLod() const;
 
     /**
@@ -261,6 +271,10 @@ protected:
     bool m_UseSinglePassWireframeRendering{true};
     bool m_ForceExplicitWireframeGeometry{false};
     bool m_AutoBuildInteractionLod{true};
+    // 交互期低模默认取 5% 面数（ParaView 的 LOD 也是在拖拽时用很粗的近似，
+    // 松手后再用全分辨率出静帧）；想更精细可调大该值或直接指定分辨率。
+    float m_InteractionLodReduction{0.05f};
+    int m_InteractionLodResolution{0};
     UnsignedCharArray::Pointer m_TriangleEdgeMasks;
     GLBuffer::Pointer m_EdgeMaskBuffer;
     GLTextureBuffer::Pointer m_EdgeMaskTexture;

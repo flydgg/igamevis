@@ -2365,7 +2365,146 @@ private:
 };
 } // namespace mesh_tetra_simplifier
 
+//------------------------------------------------------------------------------
+// 快速聚类抽稀（交互期 LOD）：规则网格顶点聚类，O(n)
+//
+// 与 ParaView 的 LOD 做法一致：把包围盒划分成 R^3 的规则网格，落在同一格子的
+// 顶点合并为一个代表点（取重心），点属性按簇取平均；三角形按簇号重映射，出现
+// 重复簇号的退化三角形直接丢弃。整个过程一次遍历点 + 一次遍历面，成本与输入
+// 规模线性相关，因此可以放在显示路径上；边收缩二次误差简化仍保留给用户显式
+// 调用的“高质量简化”。
+bool MeshSimplificationFilterPro::ExecuteClustering() {
+    SurfaceMesh::Pointer mesh = DynamicCast<SurfaceMesh>(GetInput(0));
+    if (mesh == nullptr) { return false; }
+
+    const IGsize npts = mesh->GetNumberOfPoints();
+    const IGsize nfaces = mesh->GetNumberOfFaces();
+    if (npts == 0 || nfaces == 0) { return false; }
+
+    // 网格分辨率：默认按 TargetReduction 自动推导，保持与边收缩路径一致的目标比例语义。
+    // 表面网格上被占用的格子数约 R²，输出面数约 9R²（实测 100 万点/200 万面网格：
+    // R=128 -> 14.7 万面，R=256 -> 56.5 万面，与该关系吻合），故 R ≈ sqrt(targetFaces/9)。
+    // 也可用 SetClusterResolution 直接指定（对应 ParaView 的 LOD resolution）。
+    int R = this->ClusteringResolution;
+    if (R <= 1) {
+        const double targetFaces =
+                std::max(1.0, static_cast<double>(nfaces) * std::max(1e-3f, this->TargetReduction));
+        R = static_cast<int>(std::sqrt(targetFaces / 9.0) + 0.5);
+        R = std::min(std::max(R, 8), 256);
+    }
+
+    BoundingBox box = mesh->GetBoundingBox();
+    if (box.isNull()) { return false; }
+    double minCorner[3] = {box.min[0], box.min[1], box.min[2]};
+    double extent[3];
+    for (int d = 0; d < 3; ++d) {
+        extent[d] = static_cast<double>(box.max[d]) - minCorner[d];
+        if (extent[d] <= 0.0) { extent[d] = 1.0; } // 退化（平面/直线）网格也给一个厚度
+    }
+
+    const IGsize clusterCount = static_cast<IGsize>(R) * R * R;
+    std::vector<int> count(static_cast<size_t>(clusterCount), 0);
+    std::vector<double> sum(static_cast<size_t>(clusterCount) * 3, 0.0);
+    std::vector<int> pointCluster(static_cast<size_t>(npts), -1);
+
+    // 1) 顶点归簇
+    const double invExtent[3] = {R / extent[0], R / extent[1], R / extent[2]};
+    for (IGsize i = 0; i < npts; ++i) {
+        const Point p = mesh->GetPoint(i);
+        int c[3];
+        for (int d = 0; d < 3; ++d) {
+            const double v = (static_cast<double>(p[d]) - minCorner[d]) * invExtent[d];
+            c[d] = static_cast<int>(v);
+            if (c[d] < 0) { c[d] = 0; } else if (c[d] >= R) { c[d] = R - 1; }
+        }
+        const int id = (c[2] * R + c[1]) * R + c[0];
+        pointCluster[i] = id;
+        ++count[static_cast<size_t>(id)];
+        for (int d = 0; d < 3; ++d) { sum[static_cast<size_t>(id) * 3 + d] += p[d]; }
+    }
+
+    // 2) 压缩簇号并生成代表点（重心）
+    std::vector<int> clusterMap(static_cast<size_t>(clusterCount), -1);
+    Points::Pointer newPoints = Points::New();
+    newPoints->Reserve(static_cast<IGsize>(clusterCount));
+    IGsize newPointCount = 0;
+    for (IGsize id = 0; id < clusterCount; ++id) {
+        const int n = count[static_cast<size_t>(id)];
+        if (n == 0) { continue; }
+        clusterMap[static_cast<size_t>(id)] = static_cast<int>(newPointCount);
+        const double k = 1.0 / n;
+        newPoints->AddPoint(static_cast<float>(sum[static_cast<size_t>(id) * 3 + 0] * k),
+                            static_cast<float>(sum[static_cast<size_t>(id) * 3 + 1] * k),
+                            static_cast<float>(sum[static_cast<size_t>(id) * 3 + 2] * k));
+        ++newPointCount;
+    }
+    if (newPointCount == 0) { return false; }
+
+    // 3) 面重映射（扇形三角化，丢弃退化三角形）
+    CellArray::Pointer newFaces = CellArray::New();
+    igIndex face[IGAME_CELL_MAX_SIZE]{};
+    for (IGsize f = 0; f < nfaces; ++f) {
+        const int size = mesh->GetFacePointIds(f, face);
+        if (size < 3) { continue; }
+        for (int j = 1; j + 1 < size; ++j) {
+            const int a = clusterMap[static_cast<size_t>(pointCluster[static_cast<size_t>(face[0])])];
+            const int b = clusterMap[static_cast<size_t>(pointCluster[static_cast<size_t>(face[j])])];
+            const int c = clusterMap[static_cast<size_t>(pointCluster[static_cast<size_t>(face[j + 1])])];
+            if (a < 0 || b < 0 || c < 0) { continue; }
+            if (a == b || b == c || a == c) { continue; }
+            newFaces->AddCellId3(a, b, c);
+        }
+    }
+
+    // 4) 点属性按簇取平均（单元属性在低模上没有对应关系，直接不带）
+    AttributeSet::Pointer newAttrs = AttributeSet::New();
+    if (AttributeSet::Pointer oldAttrs = mesh->GetAttributeSet(); oldAttrs != nullptr) {
+        float buf[IGAME_CELL_MAX_SIZE]{};
+        for (int i = 0; i < oldAttrs->GetNumberOfAttributes(); ++i) {
+            auto& attr = oldAttrs->GetAttribute(i);
+            if (attr.pointer == nullptr || attr.attachmentType != IG_POINT) { continue; }
+            const int dim = attr.pointer->GetDimension();
+            if (dim <= 0 || dim > IGAME_CELL_MAX_SIZE) { continue; }
+
+            std::vector<double> acc(static_cast<size_t>(newPointCount) * dim, 0.0);
+            for (IGsize p = 0; p < npts; ++p) {
+                const int cid = clusterMap[static_cast<size_t>(pointCluster[static_cast<size_t>(p)])];
+                if (cid < 0) { continue; }
+                attr.pointer->GetElement(p, buf);
+                for (int d = 0; d < dim; ++d) { acc[static_cast<size_t>(cid) * dim + d] += buf[d]; }
+            }
+
+            FloatArray::Pointer arr = FloatArray::New();
+            arr->SetName(attr.pointer->GetName());
+            arr->SetDimension(dim);
+            arr->Resize(newPointCount);
+            for (IGsize id = 0; id < clusterCount; ++id) {
+                const int n = count[static_cast<size_t>(id)];
+                if (n == 0) { continue; }
+                const int cid = clusterMap[static_cast<size_t>(id)];
+                const double k = 1.0 / n;
+                for (int d = 0; d < dim; ++d) {
+                    arr->SetValue(static_cast<IGsize>(cid) * dim + d,
+                                  static_cast<float>(acc[static_cast<size_t>(cid) * dim + d] * k));
+                }
+            }
+            newAttrs->AddAttribute(attr.type, IG_POINT, arr);
+        }
+    }
+
+    SurfaceMesh::Pointer newMesh = SurfaceMesh::New();
+    newMesh->SetName(mesh->GetName());
+    newMesh->SetPoints(newPoints);
+    newMesh->SetFaces(newFaces);
+    newMesh->SetAttributeSet(newAttrs);
+    SetOutput(newMesh);
+    return true;
+}
+
 bool MeshSimplificationFilterPro::Execute() {
+    // 交互期 LOD：走快速聚类抽稀，避免在大网格上做边收缩二次误差简化（后者在
+    // 200 万面级网格上要数分钟，会卡死显示路径）。
+    if (this->UseClustering) { return this->ExecuteClustering(); }
 
     if (DynamicCast<SurfaceMesh>(GetInput(0))) {
         using namespace meshsmp;
