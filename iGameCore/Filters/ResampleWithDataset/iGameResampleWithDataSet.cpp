@@ -19,6 +19,19 @@
 #include <limits>
 
 IGAME_NAMESPACE_BEGIN
+namespace {
+/** RAII：退出 Execute 时把进度推到 1.0（成功/失败/提前返回都一样），避免进度条卡在中间。
+ *  顺带清空文案——Qt 进度条控件在文本为空时恢复默认并隐藏。 */
+struct ResampleProgressGuard {
+    explicit ResampleProgressGuard(Filter* filter) : m_Filter(filter) {}
+    ~ResampleProgressGuard() {
+        if (m_Filter != nullptr) { m_Filter->UpdateProgress(1.0); }
+        ProgressObserver::Instance()->UpdateText(std::string());
+    }
+    Filter* m_Filter{nullptr};
+};
+} // namespace
+
 
 namespace {
 
@@ -272,6 +285,15 @@ bool ResampleWithDataSet::Execute() {
     m_SampleCellIds.clear();
     m_SampleValidMask.clear();
 
+    // 进度显示：Qt 的进度条控件订阅全局 ProgressObserver（跨线程会 marshal 回 GUI 线程），
+    // 因此这里按阶段 + 分块上报即可，无需改动采样内核。
+    ResampleProgressGuard progressGuard(this);
+    auto reportProgress = [this](double value, const std::string& text) {
+        m_ProgressObserver->UpdateText(text);
+        this->UpdateProgress(value);
+    };
+    reportProgress(0.0, "重采样：准备被采样网格…");
+
     if (source == nullptr) {
         m_Message = "未选择「被采样网格」";
         return false;
@@ -295,6 +317,7 @@ bool ResampleWithDataSet::Execute() {
     //   容器（DrawObject / CompositeDataObject / 带子数据对象）递归展开后合并为一份网格。
     int sourceBlockCount = 0;
     auto mesh = ProbeFilter::BuildSourceMesh(source.GetPointer(), &sourceBlockCount);
+    reportProgress(0.05, "重采样：定位采样点…");
     if (mesh == nullptr) {
         m_Message = std::string("「被采样网格」不支持的数据类型：") + ProbeFilter::SourceTypeName(source->GetDataObjectType()) +
                     "（支持 PointSet / SurfaceMesh / VolumeMesh / UnstructuredMesh / StructuredMesh / "
@@ -331,11 +354,30 @@ bool ResampleWithDataSet::Execute() {
     options.snapToCellWithClosestPoint = snappingEnabled;     // VTK SnapToCellWithClosestPoint
     options.snappingRadius = m_EffectiveSnappingRadius;       // <0 = 不限
 
-    std::vector<ProbeFilter::SampleLocation> kernelLocations;
-    std::vector<unsigned char> validMask;
-    if (!ProbeFilter::LocatePositions(mesh, positions, options, kernelLocations, &validMask)) {
-        m_Message = "「被采样网格」定位失败";
-        return false;
+    std::vector<ProbeFilter::SampleLocation> kernelLocations(static_cast<size_t>(sampleNum));
+    std::vector<unsigned char> validMask(static_cast<size_t>(sampleNum), 0);
+
+    // 分块调用内核对进度友好：每块内部仍然走并行（ParallelChunks），块之间上报一次进度。
+    // 块数按采样点数自适应，样本少时只有 1 块，行为与单次调用完全一致。
+    const int progressBlocks = std::min(32, std::max(1, sampleNum / 4096));
+    {
+        std::vector<Point> blockPositions;
+        std::vector<ProbeFilter::SampleLocation> blockLocations;
+        std::vector<unsigned char> blockMask;
+        for (int block = 0; block < progressBlocks; ++block) {
+            const int begin = static_cast<int>(static_cast<long long>(sampleNum) * block / progressBlocks);
+            const int end = static_cast<int>(static_cast<long long>(sampleNum) * (block + 1) / progressBlocks);
+            blockPositions.assign(positions.begin() + begin, positions.begin() + end);
+            if (!ProbeFilter::LocatePositions(mesh, blockPositions, options, blockLocations, &blockMask)) {
+                m_Message = "「被采样网格」定位失败";
+                return false;
+            }
+            std::copy(blockLocations.begin(), blockLocations.end(), kernelLocations.begin() + begin);
+            std::copy(blockMask.begin(), blockMask.end(), validMask.begin() + begin);
+            reportProgress(0.05 + 0.60 * (block + 1) / progressBlocks,
+                           "重采样：定位采样点 " + std::to_string(block + 1) + "/" +
+                                   std::to_string(progressBlocks));
+        }
     }
 
     m_SampleCellIds.assign(static_cast<size_t>(sampleNum), -1);
@@ -357,7 +399,9 @@ bool ResampleWithDataSet::Execute() {
     // 注意：对齐 vtkProbeFilter 的默认值（PassPointArrays = 0、PassCellArrays = 0），
     // 「采样点网格」自身的属性数组不复制到输出里（这两个开关针对的是探针输入，不是被采样网格）。
     AttributeSet::Pointer outAttr = AttributeSet::New();
+    reportProgress(0.70, "重采样：插值属性…");
     ProbeFilter::InterpolateAttributes(mesh, outAttr, kernelLocations, options);
+    reportProgress(0.95, "重采样：组装输出…");
 
     // 输出 = 采样点网格的同类型深拷贝（几何/拓扑独立），属性换成采样结果
     auto output = DeepCopyDataObject(probe, outAttr);
