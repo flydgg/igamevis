@@ -94,6 +94,17 @@ public:
         std::string maskArrayName{"validpointmask"}; // 掩膜数组名；空串 = 不输出掩膜
     };
 
+    /**
+     * 按「单元类型 + 点表」求值（等价 vtkCell::EvaluatePosition）：定位 + 权重由单元类型自己的
+     * VTK 复刻实现给出，未实现插值的类型退化为角点线性。供拿不到 UnstructuredMesh 的「单元定向」
+     * 重采样（如 ResampleToImage 的网格适配输入）复用同一套单元求值，避免各自重写形函数。
+     * numWeights 返回权重个数（退化时 < cellPoints.size()）；Polyhedron 等需要面拓扑的类型返回 -1。
+     * 返回 1 = 在单元内 / 0 = 不在 / -1 = 不可用或退化单元。
+     */
+    static int EvaluateCell(IGenum cellType, const std::vector<Point>& cellPoints, const Point& x,
+                            double* weights, int& numWeights, double pcoords[3],
+                            Point& closestPoint, double& dist2);
+
     /** 数据对象类型名（用于失败 / 结果消息） */
     static const char* SourceTypeName(IGenum type);
 

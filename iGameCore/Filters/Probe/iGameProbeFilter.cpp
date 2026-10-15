@@ -232,98 +232,115 @@ bool IsBlankedCell(ArrayObject* ghost, igIndex cellId) {
 }
 
 /**
- * 未实现 VTK 插值的单元类型（部分高阶 / Lagrange 等）退化为「前 N 个角点」的线性单元时
- * 需要的角点数。等价旧内核的 LinearCornerCount + 角点线性退化策略；返回 0 = 不退化。
+ * 未实现 VTK 插值的单元类型退化时所用的「角点线性」单元类型；IG_NONE = 不做退化。
+ * 等价旧内核的 LinearCornerCount + 角点线性退化策略。
  */
-int LinearCornerCountForType(IGenum type, int npts) {
+IGenum LinearTypeFor(IGenum type) {
     switch (type) {
         case IG_QUADRATIC_EDGE:
-            return 2;
+            return IG_LINE;
         case IG_QUADRATIC_TRIANGLE:
         case IG_BIQUADRATIC_TRIANGLE:
         case IG_LAGRANGE_TRIANGLE:
-            return 3;
+            return IG_TRIANGLE;
         case IG_QUADRATIC_QUAD:
         case IG_BIQUADRATIC_QUAD:
         case IG_QUADRATIC_LINEAR_QUAD:
+        case IG_QUADRATIC_POLYGON:
         case IG_LAGRANGE_QUADRILATERAL:
-            return 4;
+            return IG_QUAD;
         case IG_QUADRATIC_TETRA:
         case IG_LAGRANGE_TETRAHEDRON:
-            return 4;
+            return IG_TETRA;
         case IG_QUADRATIC_PRISM:
         case IG_QUADRATIC_LINEAR_WEDGE:
         case IG_BIQUADRATIC_QUADRATIC_WEDGE:
         case IG_LAGRANGE_PRISM:
-            return 6;
+            return IG_PRISM;
         case IG_QUADRATIC_PYRAMID:
         case IG_TRIQUADRATIC_PYRAMID:
         case IG_LAGRANGE_PYRAMID:
-            return 5;
+            return IG_PYRAMID;
         case IG_QUADRATIC_HEXAHEDRON:
         case IG_TRIQUADRATIC_HEXAHEDRON:
         case IG_BIQUADRATIC_QUADRATIC_HEXAHEDRON:
         case IG_LAGRANGE_HEXAHEDRON:
-            return 8;
-        case IG_QUADRATIC_POLYGON:
-            return (npts >= 4) ? 4 : 0; // 二次多边形：退化为前 4 个角点
+            return IG_HEXAHEDRON;
         default:
-            return 0;
+            return IG_NONE;
     }
 }
 
-/** 退化用的线性单元（每线程一份，避免与 mesh 内部共享缓存单元对象） */
-Cell* FallbackCellForType(IGenum type) {
+/**
+ * 按单元类型构造标准单元对象（每线程一份，避免与 mesh 内部共享缓存单元对象）。
+ * 覆盖线性 10 类 + 二次 7 类；需要面拓扑的 Polyhedron（以及未实现类型）返回 nullptr。
+ */
+Cell* NativeCellForType(IGenum type) {
     thread_local struct {
-        Cell::Pointer line;
-        Cell::Pointer triangle;
-        Cell::Pointer quad;
-        Cell::Pointer tetra;
-        Cell::Pointer prism;
-        Cell::Pointer pyramid;
-        Cell::Pointer hexahedron;
+        Cell::Pointer vertex, line, triangle, quad, polygon, tetra, hexahedron, prism, pyramid;
+        Cell::Pointer quadraticLine, quadraticTriangle, quadraticQuad, quadraticTetra,
+                quadraticHexahedron, quadraticPrism, quadraticPyramid;
     } cache;
 
     switch (type) {
-        case IG_QUADRATIC_EDGE:
+        case IG_VERTEX:
+            if (cache.vertex == nullptr) { cache.vertex = Vertex::New(); }
+            return cache.vertex.get();
+        case IG_LINE:
             if (cache.line == nullptr) { cache.line = Line::New(); }
             return cache.line.get();
-        case IG_QUADRATIC_TRIANGLE:
-        case IG_BIQUADRATIC_TRIANGLE:
-        case IG_LAGRANGE_TRIANGLE:
+        case IG_TRIANGLE:
             if (cache.triangle == nullptr) { cache.triangle = Triangle::New(); }
             return cache.triangle.get();
-        case IG_QUADRATIC_QUAD:
-        case IG_BIQUADRATIC_QUAD:
-        case IG_QUADRATIC_LINEAR_QUAD:
-        case IG_QUADRATIC_POLYGON:
-        case IG_LAGRANGE_QUADRILATERAL:
+        case IG_QUAD:
             if (cache.quad == nullptr) { cache.quad = Quad::New(); }
             return cache.quad.get();
-        case IG_QUADRATIC_TETRA:
-        case IG_LAGRANGE_TETRAHEDRON:
+        case IG_POLYGON:
+            if (cache.polygon == nullptr) { cache.polygon = Polygon::New(); }
+            return cache.polygon.get();
+        case IG_TETRA:
             if (cache.tetra == nullptr) { cache.tetra = Tetra::New(); }
             return cache.tetra.get();
-        case IG_QUADRATIC_PRISM:
-        case IG_QUADRATIC_LINEAR_WEDGE:
-        case IG_BIQUADRATIC_QUADRATIC_WEDGE:
-        case IG_LAGRANGE_PRISM:
-            if (cache.prism == nullptr) { cache.prism = Prism::New(); }
-            return cache.prism.get();
-        case IG_QUADRATIC_PYRAMID:
-        case IG_TRIQUADRATIC_PYRAMID:
-        case IG_LAGRANGE_PYRAMID:
-            if (cache.pyramid == nullptr) { cache.pyramid = Pyramid::New(); }
-            return cache.pyramid.get();
-        case IG_QUADRATIC_HEXAHEDRON:
-        case IG_TRIQUADRATIC_HEXAHEDRON:
-        case IG_BIQUADRATIC_QUADRATIC_HEXAHEDRON:
-        case IG_LAGRANGE_HEXAHEDRON:
+        case IG_HEXAHEDRON:
             if (cache.hexahedron == nullptr) { cache.hexahedron = Hexahedron::New(); }
             return cache.hexahedron.get();
+        case IG_PRISM:
+            if (cache.prism == nullptr) { cache.prism = Prism::New(); }
+            return cache.prism.get();
+        case IG_PYRAMID:
+            if (cache.pyramid == nullptr) { cache.pyramid = Pyramid::New(); }
+            return cache.pyramid.get();
+        case IG_QUADRATIC_EDGE:
+            if (cache.quadraticLine == nullptr) { cache.quadraticLine = QuadraticLine::New(); }
+            return cache.quadraticLine.get();
+        case IG_QUADRATIC_TRIANGLE:
+            if (cache.quadraticTriangle == nullptr) { cache.quadraticTriangle = QuadraticTriangle::New(); }
+            return cache.quadraticTriangle.get();
+        case IG_QUADRATIC_QUAD:
+            if (cache.quadraticQuad == nullptr) { cache.quadraticQuad = QuadraticQuad::New(); }
+            return cache.quadraticQuad.get();
+        case IG_QUADRATIC_TETRA:
+            if (cache.quadraticTetra == nullptr) { cache.quadraticTetra = QuadraticTetra::New(); }
+            return cache.quadraticTetra.get();
+        case IG_QUADRATIC_HEXAHEDRON:
+            if (cache.quadraticHexahedron == nullptr) { cache.quadraticHexahedron = QuadraticHexahedron::New(); }
+            return cache.quadraticHexahedron.get();
+        case IG_QUADRATIC_PRISM:
+            if (cache.quadraticPrism == nullptr) { cache.quadraticPrism = QuadraticPrism::New(); }
+            return cache.quadraticPrism.get();
+        case IG_QUADRATIC_PYRAMID:
+            if (cache.quadraticPyramid == nullptr) { cache.quadraticPyramid = QuadraticPyramid::New(); }
+            return cache.quadraticPyramid.get();
         default:
             return nullptr;
     }
+}
+
+/** 原生单元优先；未实现插值的类型退化为角点线性单元 */
+Cell* MakeCellForType(IGenum type) {
+    if (Cell* native = NativeCellForType(type)) { return native; }
+    const IGenum linear = LinearTypeFor(type);
+    return (linear == IG_NONE) ? nullptr : NativeCellForType(linear);
 }
 
 /**
@@ -345,11 +362,13 @@ Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& 
     if (cell != nullptr && cell->GetCellType() != IG_EMPTY_CELL) { return cell; }
 
     const IGenum type = mesh->GetCellType(cellId);
-    const int corners = LinearCornerCountForType(type, npts);
-    if (corners <= 0 || corners > npts) { return cell; }
-
-    Cell* fallback = FallbackCellForType(type);
+    const IGenum linear = LinearTypeFor(type);
+    Cell* fallback = (linear == IG_NONE) ? nullptr : NativeCellForType(linear);
     if (fallback == nullptr) { return cell; }
+
+    // 固定点数类型返回常量（如 Hexahedron=8）；动态类型（Polygon）用退化后的实际点数
+    const int corners = (fallback->GetCellSize() > 0) ? fallback->GetCellSize() : npts;
+    if (corners <= 0 || corners > npts) { return cell; }
 
     fallback->Reset();
     for (int i = 0; i < corners; ++i) {
@@ -362,7 +381,6 @@ Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& 
     return fallback;
 }
 
-/** 用单元类型自己的 EvaluatePosition 求采样点位置（VTK 的 vtkCell::EvaluatePosition） */
 int EvaluateCellAt(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p,
                    ProbeFilter::SampleLocation& loc) {
     int n = 0;
@@ -774,6 +792,33 @@ UnstructuredMesh::Pointer ProbeFilter::BuildSourceMesh(DataObject* object, int* 
 }
 
 
+
+int ProbeFilter::EvaluateCell(IGenum cellType, const std::vector<Point>& cellPoints, const Point& x,
+                              double* weights, int& numWeights, double pcoords[3],
+                              Point& closestPoint, double& dist2) {
+    numWeights = 0;
+    pcoords[0] = pcoords[1] = pcoords[2] = 0.0;
+    dist2 = 0.0;
+    const int n = static_cast<int>(cellPoints.size());
+    if (weights == nullptr || n <= 0 || n > IGAME_CELL_MAX_SIZE) { return -1; }
+
+    Cell* cell = MakeCellForType(cellType);
+    if (cell == nullptr) { return -1; } // 需要面拓扑（Polyhedron）或未实现类型
+
+    cell->Reset();
+    // 固定点数类型返回常量（Hexahedron=8 等）；动态类型（Polygon）Reset 后为 0，跳过最小点数检查
+    const int need = cell->GetCellSize();
+    if (need > 0 && n < need) { return -1; }
+
+    for (int i = 0; i < n; ++i) {
+        cell->m_Points->AddPoint(cellPoints[i][0], cellPoints[i][1], cellPoints[i][2]);
+        cell->m_PointIds->AddId(i);
+    }
+    numWeights = (cell->GetCellSize() > 0) ? cell->GetCellSize() : n;
+
+    int subId = 0;
+    return cell->EvaluatePosition(x, closestPoint, subId, pcoords, dist2, weights);
+}
 
 const char* ProbeFilter::SourceTypeName(IGenum type) {
     switch (type) {
