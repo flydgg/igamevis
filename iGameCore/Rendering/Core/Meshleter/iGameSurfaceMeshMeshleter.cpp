@@ -15,10 +15,13 @@ SurfaceMeshMeshleter::SurfaceMeshMeshleter() {}
 SurfaceMeshMeshleter::~SurfaceMeshMeshleter() {}
 
 void SurfaceMeshMeshleter::Build() {
-#ifdef __EMSCRIPTEN__
-    // WebGL1/GLES2 does not support the meshlet GPU path (SSBO/indirect draw).
-    // Keep meshlet disabled on wasm to preserve the basic rendering pipeline.
+#ifndef IGAME_OPENGL_VERSION_460
+    // The GPU meshlet path requires shader-storage buffers and indirect draws,
+    // which are not available in the macOS 3.3 renderer or WebGL/GLES2 path.
     m_MeshletCount = 0;
+    if (auto drawObject = DynamicCast<DrawObject>(m_DataObject)) {
+        drawObject->SetAccelerationOption(false);
+    }
     this->Modified();
     return;
 #else

@@ -1,7 +1,6 @@
 set(MODULE_NAME iGameCore)
 set(CMAKE_CXX_STANDARD 20)
 #=====添加路径======
-set(Qt5_DIR "D:/Qt/Qt5.14.2/5.14.2/msvc2017_64/lib/cmake/Qt5")
 #=================
 set(IGAMEVIS_CORE_ROOT_DIR ${IGAMEVIS_ROOT_DIR}/iGameCore)
 
@@ -25,15 +24,28 @@ else ()
     add_library(${MODULE_NAME} STATIC ${IGAME_CORE_FILE} "IO/Fluent/iGameCASReader.h" "Filters/StreamView/iGameStreamlineSimplifier.h" "Filters/StreamView/iGameStreamlineSimplifier.cpp")
 endif ()
 
-if (UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
+if (APPLE AND NOT EMSCRIPTEN)
+    # OpenMP is optional on macOS (Clang does not ship omp.h by default).
+    # Homebrew's libomp is picked up when installed; otherwise these sources
+    # retain their serial fallback.
+    find_package(OpenMP QUIET)
+elseif (UNIX AND NOT EMSCRIPTEN)
     find_package(OpenMP REQUIRED)
-    if (OpenMP_CXX_FOUND)
-        target_link_libraries(${MODULE_NAME} PUBLIC OpenMP::OpenMP_CXX)
-    endif ()
+endif ()
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(${MODULE_NAME} PUBLIC OpenMP::OpenMP_CXX)
 endif ()
 
 # add rendering core
 add_subdirectory(Rendering)
+
+# GLAD loads function pointers at runtime, while the native macOS OpenGL
+# framework provides the system implementation. Link it explicitly so both
+# the GUI and standalone core consumers receive the framework dependency.
+if (APPLE AND NOT EMSCRIPTEN)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(${MODULE_NAME} PUBLIC OpenGL::GL)
+endif ()
 
 target_include_directories(${MODULE_NAME} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/CSTest>

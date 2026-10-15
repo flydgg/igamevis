@@ -4,9 +4,6 @@
 #include "iGameThreadPool.h"
 #include <mutex>
 #include <new>
-#ifndef __EMSCRIPTEN__
-#include <omp.h>
-#endif
 #include <stdexcept>
 IGAME_NAMESPACE_BEGIN
 #define ArrayList std::vector<ArrayObject>

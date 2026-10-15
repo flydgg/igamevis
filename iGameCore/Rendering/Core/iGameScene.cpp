@@ -198,8 +198,8 @@ bool Scene::Initialize() {
         return false;
     }
 
-    this->InitOpenGL();
-#ifndef IGAME_OPENGL_VERSION_GLES2
+    if (!this->InitOpenGL()) { return false; }
+#ifdef IGAME_OPENGL_VERSION_460
     this->InitOIT();
 #endif
     this->InitAxes();
@@ -524,9 +524,27 @@ SmartPointer<GLShaderProgram> Scene::GetShader(ShaderType type) {
     return m_ShaderManager->GetShader(type);
 }
 
-void Scene::InitOpenGL() {
+bool Scene::InitOpenGL() {
 #ifndef __EMSCRIPTEN__
-    if (!gladLoadGL()) { IGAME_RENDERING_ERROR("Failed to initialize GLAD"); }
+    if (!gladLoadGL()) {
+#ifdef IGAME_PLATFORM_MACOS
+        IGAME_RENDERING_ERROR(
+                "Failed to load macOS OpenGL entry points. Ensure an active OpenGL 3.3+ context exists.");
+#else
+        IGAME_RENDERING_ERROR("Failed to initialize GLAD");
+#endif
+        return false;
+    }
+#ifdef IGAME_PLATFORM_MACOS
+    // macOS supplies OpenGL 4.1 at most; the application deliberately uses
+    // the GL 3.3 feature set. Fail before dereferencing unloaded GL entry points
+    // if a non-core or older context was supplied by the host.
+    if (GLVersion.major < 3 || (GLVersion.major == 3 && GLVersion.minor < 3)) {
+        IGAME_RENDERING_ERROR("macOS OpenGL context is too old ({}.{}); OpenGL 3.3 is required",
+                              GLVersion.major, GLVersion.minor);
+        return false;
+    }
+#endif
 #endif
 
     // log opengl info
@@ -610,6 +628,7 @@ void Scene::InitOpenGL() {
     }
 
     GLCheckError();
+    return true;
 }
 
 void Scene::InitOIT() {
@@ -1151,7 +1170,7 @@ void Scene::DrawFrame() {
 #ifdef IGAME_OPENGL_VERSION_330
         ShadowPass();
         ForwardPass();
-    #ifdef __EMSCRIPTEN__
+    #if defined(__EMSCRIPTEN__) || defined(IGAME_PLATFORM_MACOS)
         TransparentPass();
     #endif
 #else
@@ -1493,6 +1512,31 @@ void Scene::TransparentPass() {
     glEnable(GL_DEPTH_TEST);
 
     // glDisable(GL_BLEND);
+#elif defined(IGAME_PLATFORM_MACOS)
+    // macOS exposes OpenGL 4.1, so use the forward renderer instead of the
+    // compute/image-load-store OIT pipeline. Render transparent objects with
+    // the same depth-prepass fallback used by WebGL.
+    BindFramebuffer();
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_GREATER);
+    glDisable(GL_BLEND);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glDepthMask(GL_TRUE);
+    for (auto it = m_ModelPool->Begin(); it != m_ModelPool->End(); ++it) {
+        it->second->DrawWithTransparency();
+    }
+
+    glDepthMask(GL_FALSE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthFunc(GL_GEQUAL);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    for (auto it = m_ModelPool->Begin(); it != m_ModelPool->End(); ++it) {
+        it->second->DrawWithTransparency();
+    }
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glDepthFunc(GL_GREATER);
 #endif
     glDisable(GL_DEPTH_TEST);
     GLCheckError();

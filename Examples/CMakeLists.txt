@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.19)
 
-add_definitions(/D_USE_MATH_DEFINES)
+if (MSVC)
+    add_compile_definitions(_USE_MATH_DEFINES)
+endif ()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 project("iGameExamples" LANGUAGES CXX)

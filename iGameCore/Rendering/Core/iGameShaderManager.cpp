@@ -22,6 +22,31 @@ SmartPointer<GLShaderProgram> ShaderManager::GetShader(ShaderType type) {
 
     sp = this->GenShader(type);
     if (sp == nullptr) { IGAME_RENDERING_ERROR("Error for GenShader"); }
+#ifdef IGAME_PLATFORM_MACOS
+    // Without 420pack, GLSL cannot declare UBO binding points. Restore the
+    // renderer's standard block bindings explicitly for shaders that use them.
+    switch (type) {
+        case ShaderType::BLINNPHONG:
+        case ShaderType::PBR:
+        case ShaderType::NOLIGHT:
+        case ShaderType::PURECOLOR:
+        case ShaderType::SINGLEPASSWIREFRAME:
+        case ShaderType::REMOTE_SINGLEPASSWIREFRAME:
+        case ShaderType::TRANSPARENCYLINK:
+            sp->MapUniformBlock("CameraDataBlock", 0, m_CameraDataBlock);
+            sp->MapUniformBlock(
+                    type == ShaderType::PBR ? "ObjectDataBLock"
+                                            : "ObjectDataBlock",
+                    1, m_ObjectDataBlock);
+            if (type == ShaderType::PBR) {
+                sp->MapUniformBlock("ObjectDataBlock", 1, m_ObjectDataBlock);
+            }
+            sp->MapUniformBlock("UniformBufferObjectBlock", 2, m_UBOBlock);
+            break;
+        default:
+            break;
+    }
+#endif
     this->SetShader(type, sp);
 
     return sp;
@@ -193,7 +218,7 @@ void ShaderManager::MapBufferBlock() {
     shader->MapUniformBlock("UniformBufferObjectBlock", 2, m_UBOBlock);
 
     // map transparency link shader block
-#ifdef IGAME_OPENGL_VERSION_460
+#if defined(IGAME_OPENGL_VERSION_460) || defined(IGAME_PLATFORM_MACOS)
     shader = this->GetShader(ShaderType::TRANSPARENCYLINK);
     shader->MapUniformBlock("CameraDataBlock", 0, m_CameraDataBlock);
     shader->MapUniformBlock("ObjectDataBlock", 1, m_ObjectDataBlock);
@@ -341,11 +366,16 @@ SmartPointer<GLShaderProgram> ShaderManager::GenShader(ShaderType type) {
             sp->SetName("REMOTE_SINGLEPASSWIREFRAME");
             sp->AddShaders(vertex_vert, wireframe_geom, wireframe_frag);
         } break;
-#if defined(IGAME_OPENGL_VERSION_460) || defined(__EMSCRIPTEN__)
+#if defined(IGAME_OPENGL_VERSION_460) || defined(__EMSCRIPTEN__) || \
+        defined(IGAME_PLATFORM_MACOS)
         case ShaderType::TRANSPARENCYLINK: {
 #ifdef __EMSCRIPTEN__
             SmartPointer<GLShader> vertex_vert = GLShader::CreateShader(
                     std::string("./Resources/Shaders/TransparencyLink.vert"),
+                    GL_VERTEX_SHADER);
+#elif defined(IGAME_PLATFORM_MACOS)
+            SmartPointer<GLShader> vertex_vert = GLShader::CreateShader(
+                    std::string("./Resources/Shaders/Vertex.vert"),
                     GL_VERTEX_SHADER);
 #else
             SmartPointer<GLShader> vertex_vert = GLShader::CreateShader(
@@ -353,10 +383,17 @@ SmartPointer<GLShaderProgram> ShaderManager::GenShader(ShaderType type) {
                     GL_VERTEX_SHADER);
 #endif
 
+#ifdef IGAME_PLATFORM_MACOS
+            SmartPointer<GLShader> transparencyLink_frag =
+                    GLShader::CreateShader(std::string("./Resources/Shaders/"
+                                                       "TransparencyForward.frag"),
+                                           GL_FRAGMENT_SHADER);
+#else
             SmartPointer<GLShader> transparencyLink_frag =
                     GLShader::CreateShader(std::string("./Resources/Shaders/"
                                                        "TransparencyLink.frag"),
                                            GL_FRAGMENT_SHADER);
+#endif
 
             sp->SetName("TRANSPARENCYLINK");
             sp->AddShaders(vertex_vert, transparencyLink_frag);

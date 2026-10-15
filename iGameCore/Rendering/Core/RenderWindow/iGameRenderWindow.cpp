@@ -36,8 +36,17 @@ iGame::RenderWindow::RenderWindow() {
     });
     /* set glfw version */
 #ifdef IGAME_OPENGL_VERSION_330
+#ifdef IGAME_PLATFORM_MACOS
+    // Apple's OpenGL implementation offers the 4.1 core profile rather than
+    // an independently requestable 3.3 context. The renderer uses its 3.3
+    // feature set on that context.
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+#else
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+#endif
 #elif IGAME_OPENGL_VERSION_GLES2
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);

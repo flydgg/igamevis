@@ -96,23 +96,26 @@ iGame::UnstructuredMesh::Pointer MakeUnitHexahedron() {
     return mesh;
 }
 
-/** 5 个采样点 + 一个探针自带的标量数组 "probe_marker" */
+/** 6 个采样点 + 一个探针自带的标量数组 "probe_marker" */
 iGame::PointSet::Pointer MakeProbePoints() {
     auto probe = iGame::PointSet::New();
     probe->SetName("probe_points");
 
     probe->AddPoint(iGame::Point(0.5f, 0.5f, 0.5f));    // 0: 体心（对称 -> 3.5）
     probe->AddPoint(iGame::Point(0.0f, 0.0f, 0.0f));    // 1: 角点
-    probe->AddPoint(iGame::Point(-0.001f, -0.001f, -0.001f)); // 2: 刚出盒（近）
+    // 2: 盒外且超出 VTK 默认容差（到 [0,1]^3 的距离 sqrt(3)*1e-2 ≈ 1.73e-2 > 对角线*1e-3 ≈ 1.73e-3）
+    probe->AddPoint(iGame::Point(-0.01f, -0.01f, -0.01f));
     probe->AddPoint(iGame::Point(10.0f, 10.0f, 10.0f)); // 3: 远处盒外
     probe->AddPoint(iGame::Point(0.5f, 0.5f, 0.0f));    // 4: 面心
+    // 5: 盒外但在 VTK 默认容差内（距离 sqrt(3)*5e-4 ≈ 8.66e-4 < 1.73e-3）
+    probe->AddPoint(iGame::Point(-0.0005f, -0.0005f, -0.0005f));
 
     auto attrs = iGame::AttributeSet::New();
     auto marker = iGame::FloatArray::New();
     marker->SetName("probe_marker");
     marker->SetDimension(1);
-    marker->Resize(5);
-    for (int i = 0; i < 5; ++i) {
+    marker->Resize(6);
+    for (int i = 0; i < 6; ++i) {
         const double v = 100.0 + static_cast<double>(i);
         marker->SetElement(static_cast<IGsize>(i), &v);
     }
@@ -241,10 +244,10 @@ void TestPointCloudProbe() {
         Check(false, "输出可转换为 PointSet");
         return;
     }
-    Check(outPoints->GetNumberOfPoints() == 5, "输出点数 = 5");
+    Check(outPoints->GetNumberOfPoints() == 6, "输出点数 = 6");
 
     bool coordsEqual = true;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 6; ++i) {
         const iGame::Point a = outPoints->GetPoint(static_cast<IGsize>(i));
         const iGame::Point b = probe->GetPoint(static_cast<IGsize>(i));
         for (int c = 0; c < 3; ++c) {
@@ -254,14 +257,14 @@ void TestPointCloudProbe() {
     Check(coordsEqual, "输出坐标与采样点网格逐点一致");
 
     const std::vector<unsigned char>& mask = filter->GetSampleValidMask();
-    Check(mask.size() == 5, "GetSampleValidMask() 长度为 5");
+    Check(mask.size() == 6, "GetSampleValidMask() 长度为 6");
 
     int maskHits = 0;
     auto outMask = FindPointArray(output->GetAttributeSet(), "validpointmask", &maskHits);
     Check(outMask != nullptr && maskHits == 1, "输出含 validpointmask（且只有一个）");
-    bool maskMatches = (outMask != nullptr) && (outMask->GetNumberOfValues() == 5);
+    bool maskMatches = (outMask != nullptr) && (outMask->GetNumberOfValues() == 6);
     if (maskMatches) {
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 6; ++i) {
             if (static_cast<unsigned char>(outMask->GetElementValue(static_cast<IGsize>(i), 0)) !=
                 mask[static_cast<size_t>(i)]) {
                 maskMatches = false;
@@ -276,6 +279,8 @@ void TestPointCloudProbe() {
     if (outValue != nullptr && mask[0] == 1) { CheckNear(outValue->GetElementValue(0, 0), 3.5, 1e-3, "体心插值 = 3.5"); }
 
     // 远处点：无效且插值填 0
+    Check(mask[2] == 0, "近距盒外点（2）超出 VTK 默认容差：无效");
+    Check(mask[5] == 1, "盒外但落在 VTK 默认容差内（0.1% 对角线）的点（5）：有效");
     Check(mask[3] == 0, "远处盒外点（3）无效");
     if (outValue != nullptr) { CheckNear(outValue->GetElementValue(3, 0), 0.0, 1e-6, "无效点的插值填 0"); }
 
@@ -307,7 +312,8 @@ void TestPointCloudProbe() {
     }
 
     std::cout << "        有效点数 = " << static_cast<int>(filter->GetSampleValidMask().size()) << " 中 "
-              << "有效=" << (int)mask[0] << (int)mask[1] << (int)mask[2] << (int)mask[3] << (int)mask[4] << std::endl;
+              << "有效=" << (int)mask[0] << (int)mask[1] << (int)mask[2] << (int)mask[3] << (int)mask[4]
+              << (int)mask[5] << std::endl;
 }
 
 /* ------------------------------------------------------------------ */
@@ -326,23 +332,23 @@ void TestSnappingRadius() {
         filter->SetSnappingRadius(0.0);
         Check(filter->Execute(), "radius=0: Execute() 成功");
         const std::vector<unsigned char>& mask = filter->GetSampleValidMask();
-        Check(mask.size() == 5 && mask[2] == 0, "radius=0: 近距盒外点（2）无效");
+        Check(mask.size() == 6 && mask[2] == 0, "radius=0: 近距盒外点（2）无效（超出 VTK 默认容差）");
         Check(filter->GetSnappedPointCount() == 0, "radius=0: 吸附点数为 0");
     }
 
-    // 开启吸附：对角线 ≈ 1.732，半径 0.01 * diag ≈ 0.0173 > 0.001*sqrt(3)
+    // 开启吸附：对角线 ≈ 1.732，半径 0.02 * diag ≈ 0.0346 > 0.01*sqrt(3) ≈ 0.0173
     {
         auto mesh = MakeUnitHexahedron();
         auto probe = MakeProbePoints();
         auto filter = iGame::ResampleWithDataSet::New();
         filter->SetSourceData(mesh);
         filter->SetProbeData(probe);
-        filter->SetSnappingRadius(0.01);
-        Check(filter->Execute(), "radius=0.01: Execute() 成功");
+        filter->SetSnappingRadius(0.02);
+        Check(filter->Execute(), "radius=0.02: Execute() 成功");
         const std::vector<unsigned char>& mask = filter->GetSampleValidMask();
-        Check(mask.size() == 5 && mask[2] == 1, "radius=0.01: 近距盒外点（2）被吸附为有效");
-        Check(filter->GetSnappedPointCount() >= 1, "radius=0.01: 吸附点数 >= 1");
-        Check(mask[3] == 0, "radius=0.01: 远处盒外点（3）仍然无效");
+        Check(mask.size() == 6 && mask[2] == 1, "radius=0.02: 近距盒外点（2）被吸附为有效");
+        Check(filter->GetSnappedPointCount() >= 1, "radius=0.02: 吸附点数 >= 1");
+        Check(mask[3] == 0, "radius=0.02: 远处盒外点（3）仍然无效");
     }
 }
 

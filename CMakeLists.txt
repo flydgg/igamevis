@@ -108,7 +108,9 @@ add_compile_options(
         "$<$<AND:$<C_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C>>:/utf-8>"
         "$<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:CXX>>:/utf-8>"
 )
-add_definitions(/D_USE_MATH_DEFINES)
+if (MSVC)
+    add_compile_definitions(_USE_MATH_DEFINES)
+endif ()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 

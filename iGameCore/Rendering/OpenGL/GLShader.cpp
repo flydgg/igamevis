@@ -2,7 +2,9 @@
 // Created by Sumzeek on 12/9/2024.
 //
 #include "GLShader.h"
+#include <cctype>
 #include <filesystem>
+#include <vector>
 
 IGAME_NAMESPACE_BEGIN
 
@@ -27,6 +29,139 @@ void GLShader::Compile(const char* const file_path, GLenum type) {
     m_Handle = glCreateShader(type);
 
     std::string sourceStr = ReadFile(file_path);
+#ifdef IGAME_PLATFORM_MACOS
+    // Apple's OpenGL 4.1 driver does not expose ARB_shading_language_420pack.
+    // Uniform-block bindings are assigned with glUniformBlockBinding instead.
+    const auto removeLine = [&sourceStr](const char* line) {
+        size_t position = 0;
+        while ((position = sourceStr.find(line, position)) != std::string::npos) {
+            const size_t lineEnd = sourceStr.find('\n', position);
+            sourceStr.erase(position,
+                            lineEnd == std::string::npos
+                                    ? std::string::npos
+                                    : lineEnd - position + 1);
+        }
+    };
+    removeLine("#extension GL_ARB_shading_language_420pack : enable");
+    removeLine("#extension GL_ARB_separate_shader_objects : enable");
+
+    const std::string bindingQualifier = ", binding = ";
+    size_t bindingPosition = 0;
+    while ((bindingPosition = sourceStr.find(bindingQualifier,
+                                             bindingPosition)) !=
+           std::string::npos) {
+        const size_t qualifierEnd = sourceStr.find(')', bindingPosition);
+        if (qualifierEnd == std::string::npos) { break; }
+        // Keep the rest of the layout qualifiers (for example std140), and
+        // remove only the 4.2 binding assignment.
+        sourceStr.erase(bindingPosition, qualifierEnd - bindingPosition);
+    }
+
+    // GLSL 4.10 on Apple's driver accepts locations for vertex attributes and
+    // fragment outputs, but not for inter-stage varyings. Match those varyings
+    // by name, as GLSL 3.30 requires, and strip the unsupported qualifiers.
+    std::vector<std::pair<std::string, std::string>> varyingRenames;
+    size_t locationPosition = 0;
+    while ((locationPosition = sourceStr.find("layout", locationPosition)) !=
+           std::string::npos) {
+        const size_t openParen = sourceStr.find('(', locationPosition + 6);
+        const size_t closeParen = sourceStr.find(')', openParen);
+        if (openParen == std::string::npos || closeParen == std::string::npos) {
+            break;
+        }
+
+        const std::string layoutContents =
+                sourceStr.substr(openParen + 1, closeParen - openParen - 1);
+        if (layoutContents.find("location") == std::string::npos) {
+            locationPosition = closeParen + 1;
+            continue;
+        }
+
+        size_t declaration = closeParen + 1;
+        while (declaration < sourceStr.size() &&
+               std::isspace(static_cast<unsigned char>(sourceStr[declaration]))) {
+            ++declaration;
+        }
+        const bool isInput = sourceStr.compare(declaration, 2, "in") == 0 &&
+                             (declaration + 2 >= sourceStr.size() ||
+                              !std::isalnum(static_cast<unsigned char>(
+                                      sourceStr[declaration + 2])));
+        const bool isOutput = sourceStr.compare(declaration, 3, "out") == 0 &&
+                              (declaration + 3 >= sourceStr.size() ||
+                               !std::isalnum(static_cast<unsigned char>(
+                                       sourceStr[declaration + 3])));
+        const bool removeLocation =
+                (type == GL_GEOMETRY_SHADER && (isInput || isOutput)) ||
+                (type == GL_VERTEX_SHADER && isOutput) ||
+                (type == GL_FRAGMENT_SHADER && isInput);
+        if (removeLocation) {
+            const size_t equalsPosition = layoutContents.find('=');
+            int location = 0;
+            if (equalsPosition != std::string::npos) {
+                try {
+                    location = std::stoi(layoutContents.substr(equalsPosition + 1));
+                } catch (...) {
+                    location = 0;
+                }
+            }
+
+            size_t identifierStart = declaration + (isInput ? 2 : 3);
+            while (identifierStart < sourceStr.size() &&
+                   std::isspace(static_cast<unsigned char>(
+                           sourceStr[identifierStart]))) {
+                ++identifierStart;
+            }
+            while (identifierStart < sourceStr.size() &&
+                   !std::isspace(static_cast<unsigned char>(
+                           sourceStr[identifierStart]))) {
+                ++identifierStart;
+            }
+            while (identifierStart < sourceStr.size() &&
+                   std::isspace(static_cast<unsigned char>(
+                           sourceStr[identifierStart]))) {
+                ++identifierStart;
+            }
+            const size_t identifierEnd = sourceStr.find_first_not_of(
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_",
+                    identifierStart);
+            if (identifierStart < sourceStr.size()) {
+                const size_t end = identifierEnd == std::string::npos
+                                           ? sourceStr.size()
+                                           : identifierEnd;
+                varyingRenames.emplace_back(
+                        sourceStr.substr(identifierStart, end - identifierStart),
+                        "igame_varying_" + std::to_string(location));
+            }
+            sourceStr.erase(locationPosition, declaration - locationPosition);
+            continue;
+        }
+        locationPosition = declaration;
+    }
+
+    for (const auto& [name, replacement] : varyingRenames) {
+        size_t position = 0;
+        while ((position = sourceStr.find(name, position)) !=
+               std::string::npos) {
+            const bool leftBoundary =
+                    position == 0 ||
+                    (!std::isalnum(static_cast<unsigned char>(
+                             sourceStr[position - 1])) &&
+                     sourceStr[position - 1] != '_');
+            const size_t afterName = position + name.size();
+            const bool rightBoundary =
+                    afterName == sourceStr.size() ||
+                    (!std::isalnum(static_cast<unsigned char>(
+                             sourceStr[afterName])) &&
+                     sourceStr[afterName] != '_');
+            if (leftBoundary && rightBoundary) {
+                sourceStr.replace(position, name.size(), replacement);
+                position += replacement.size();
+            } else {
+                position = afterName;
+            }
+        }
+    }
+#endif
     const char* source = sourceStr.c_str();
 
     auto src_cpy = source;

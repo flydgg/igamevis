@@ -123,7 +123,14 @@ int main(int argc, char* argv[]) {
 
     QSurfaceFormat format;
     format.setRenderableType(QSurfaceFormat::OpenGL);
-    format.setVersion(4, 6); // Mac set to format.setVersion(3, 3);
+#ifdef __APPLE__
+    // macOS provides a maximum OpenGL 4.1 core context. The renderer uses its
+    // portable 3.3 feature set there, but request 4.1 so QOpenGLWidget does not
+    // fall back to the platform's legacy context.
+    format.setVersion(4, 1);
+#else
+    format.setVersion(4, 6);
+#endif
     format.setProfile(QSurfaceFormat::CoreProfile);
     format.setRedBufferSize(8); // RGBA8
     format.setGreenBufferSize(8);

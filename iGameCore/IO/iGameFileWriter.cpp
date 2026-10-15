@@ -240,7 +240,7 @@ bool FileWriter::SaveBufferDataToFileWithMac()
 		perror("munmap failed");
 	}
 	close(fd);
-    IGAME_CORE_TRACE("Write buffer to file with mmap (macOS) successful.")
+    IGAME_CORE_TRACE("Write buffer to file with mmap (macOS) successful.");
 #endif
 	return true;
 }

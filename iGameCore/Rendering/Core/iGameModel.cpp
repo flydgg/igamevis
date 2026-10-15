@@ -249,11 +249,18 @@ void Model::Draw() {
         auto drawObject = DynamicCast<DrawObject>(dataObject);
         if (!drawObject->GetVisibility()) { return; }
 
-#if !defined(IGAME_OPENGL_VERSION_330) || defined(__EMSCRIPTEN__)
+#if !defined(IGAME_OPENGL_VERSION_330) || defined(__EMSCRIPTEN__) || \
+        defined(IGAME_PLATFORM_MACOS)
         bool hasTransparency = drawObject->GetTransparency() < 1.0f;
         bool hasAcceleration = drawObject->GetAccelerationOption();
         bool hasOpacityMapping = drawObject->GetOpacityMappingEnabled();
+#ifdef IGAME_PLATFORM_MACOS
+        // Meshlet acceleration is unavailable in the macOS forward renderer;
+        // keep those objects in the normal draw path instead of dropping them.
+        if (hasTransparency || hasOpacityMapping) { return; }
+#else
         if (hasTransparency || hasAcceleration || hasOpacityMapping) { return; }
+#endif
 #endif
 
         // Render

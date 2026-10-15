@@ -6,9 +6,40 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT Qt5_DIR AND DEFINED ENV{QT_HOME})
-    set(Qt5_DIR "$ENV{QT_HOME}/5.15.2/msvc2019_64/lib/cmake/Qt5")
+    if(WIN32)
+        set(_qt5_test_candidates
+            "$ENV{QT_HOME}/lib/cmake/Qt5"
+            "$ENV{QT_HOME}/5.15.2/msvc2019_64/lib/cmake/Qt5")
+    elseif(APPLE)
+        set(_qt5_test_candidates
+            "$ENV{QT_HOME}/lib/cmake/Qt5"
+            "$ENV{QT_HOME}/5.15.2/clang_64/lib/cmake/Qt5")
+    else()
+        set(_qt5_test_candidates
+            "$ENV{QT_HOME}/lib/cmake/Qt5"
+            "$ENV{QT_HOME}/5.15.2/gcc_64/lib/cmake/Qt5")
+    endif()
+    foreach(_qt5_test_candidate IN LISTS _qt5_test_candidates)
+        if(EXISTS "${_qt5_test_candidate}/Qt5Config.cmake")
+            set(Qt5_DIR "${_qt5_test_candidate}" CACHE PATH "Qt5 CMake package directory" FORCE)
+            break()
+        endif()
+    endforeach()
 endif()
-find_package(Qt5 REQUIRED COMPONENTS Core)
+if(APPLE AND NOT Qt5_DIR)
+    set(_qt5_test_candidates
+        /opt/homebrew/opt/qt5/lib/cmake/Qt5
+        /opt/homebrew/opt/qt@5/lib/cmake/Qt5
+        /usr/local/opt/qt5/lib/cmake/Qt5
+        /usr/local/opt/qt@5/lib/cmake/Qt5)
+    foreach(_qt5_test_candidate IN LISTS _qt5_test_candidates)
+        if(EXISTS "${_qt5_test_candidate}/Qt5Config.cmake")
+            set(Qt5_DIR "${_qt5_test_candidate}" CACHE PATH "Qt5 CMake package directory" FORCE)
+            break()
+        endif()
+    endforeach()
+endif()
+find_package(Qt5 CONFIG REQUIRED COMPONENTS Core)
 
 get_filename_component(IGAMEVIS_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 

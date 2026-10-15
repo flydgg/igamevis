@@ -8,7 +8,7 @@
 #include "iGameUnstructuredMesh.h"
 #include "iGameVolumeMesh.h"
 #include <cmath>
-#ifndef __EMSCRIPTEN__
+#ifdef _OPENMP
 #include <omp.h>
 #endif
 #include <string>

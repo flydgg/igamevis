@@ -1,7 +1,10 @@
 #target_include_directories(${PROJECT_NAME} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
-set(GLAD_VERSION glad460)
-#set(GLAD_VERSION glad330)
+if (APPLE OR IGAME_RENDER_BACKEND STREQUAL "GLES2")
+    set(GLAD_VERSION glad330)
+else ()
+    set(GLAD_VERSION glad460)
+endif ()
 
 file(GLOB_RECURSE srcs CONFIGURE_DEPENDS ${GLAD_VERSION}/src/*.c ${GLAD_VERSION}/include/glad/*.h)
 

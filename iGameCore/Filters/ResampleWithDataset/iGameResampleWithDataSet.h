@@ -47,7 +47,8 @@ IGAME_NAMESPACE_BEGIN
  *
  * 采样与容差：
  *   - 采样位置是输入 1 的所有点，不再沿线均匀生成；
- *   - 容差默认自动（被采样网格包围盒对角线 × 1e-6），可用 SetTolerance() 手动指定；
+ *   - 容差默认自动，对齐 vtkProbeFilter 的默认值（被采样网格包围盒对角线 × 1e-3，
+ *     即 VTK 的 tol2 = 对角线² × 1e-6），可用 SetTolerance() 手动指定；
  *   - 采样点落在所有单元之外时可选的「吸附半径」：SetSnappingRadius(r) 打开后，若在 r
  *     （相对包围盒对角线）范围内存在单元，则把该点吸附到最近单元的边界最近点处取值，
  *     该采样点记为有效。对应 vtkProbeFilter 的 SnappingRadius；本实现不移动采样点坐标。
@@ -80,7 +81,7 @@ public:
 
     /**
      * 手动指定容差（相对被采样网格包围盒对角线长度）。
-     * t <= 0 时恢复自动容差（包围盒对角线 × 1e-6）。
+     * t <= 0 时恢复自动容差（VTK 默认：包围盒对角线 × 1e-3）。
      */
     void SetTolerance(double t) {
         if (t > 0.0) {
@@ -128,52 +129,9 @@ public:
     IGsize GetUnsupportedQuadraticCellCount() const { return m_UnsupportedQuadraticCellCount; }
 
 private:
-    /** 单个采样点的定位与插值权重 */
-    struct SampleLocation {
-        igIndex cellId{-1};            // 命中的单元 id，-1 = 无效
-        Point point{0.f, 0.f, 0.f};    // 采样点
-        std::vector<igIndex> pointIds; // 命中单元的点 id（与权重一一对应）
-        std::vector<double> weights;   // 插值权重
-    };
-
-    /* ---------------- 几何搜索 ---------------- */
-    std::vector<std::vector<igIndex>> BuildUniformGrid(const UnstructuredMesh::Pointer& mesh,
-                                                       const BoundingBox& bbox, igIndex nx, igIndex ny, igIndex nz);
-    bool LocateSample(const UnstructuredMesh::Pointer& mesh, const Point& p, const BoundingBox& bbox,
-                      const std::vector<std::vector<igIndex>>& grid, igIndex nx, igIndex ny, igIndex nz,
-                      double distTol, SampleLocation& out);
-    /**
-     * 吸附搜索：在 radius（绝对长度）范围内寻找离 p 最近的单元，并给出该单元边界上的最近点。
-     * 只有采样点未被任何单元包含（LocateSample 失败）且开启了吸附半径时才会调用。
-     */
-    bool LocateNearestCell(const UnstructuredMesh::Pointer& mesh, const Point& p, const BoundingBox& bbox,
-                           const std::vector<std::vector<igIndex>>& grid, igIndex nx, igIndex ny, igIndex nz,
-                           double radius, igIndex& cellId, Point& closest);
-
-    /* ---------------- 单元权重 ---------------- */
-    bool ComputeCellWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol,
-                            std::vector<double>& weights);
-    bool ComputeLinearFaceWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol,
-                                  std::vector<double>& weights);
-    bool ComputeMeanValueWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol,
-                                 std::vector<double>& weights);
-    bool ComputeQuadraticWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol,
-                                 std::vector<double>& weights);
-    /** 高次体单元退化：用线性角点单元的面表做均值坐标插值 */
-    bool ComputeDegradedVolumeWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p,
-                                     double distTol, std::vector<double>& weights);
-    bool IsPointInVolumeCell(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol);
-    double DistanceToCellBoundary(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, Point& closest);
-
-    /* ---------------- 属性处理 ---------------- */
-    /** 输入 0 的点数据插值 → 输出点；返回已产出的数组名（供单元数据判重：同名时点数据优先） */
-    std::vector<std::string> InterpolatePointData(AttributeSet* inSet, AttributeSet::Pointer outSet,
-                                                 const std::vector<SampleLocation>& locations, int sampleNum);
-    /** 输入 0 的单元数据按命中单元 → 输出点；pointNames 中的名字（源点数据）优先，同名跳过 */
-    void CopyCellData(AttributeSet* inSet, AttributeSet::Pointer outSet,
-                      const std::vector<SampleLocation>& locations, int sampleNum,
-                      const std::vector<std::string>& pointNames);
-    void AddValidPointMask(AttributeSet::Pointer outSet, int sampleNum);
+    // 采样定位 / 权重 / 属性插值全部由 ProbeFilter 采样内核完成（见 iGameProbeFilter.h）：
+    //   ProbeFilter::BuildSourceMesh / LocatePositions / InterpolateAttributes
+    // 本类只负责：输入归一化调用、把内核结果整理成本类的查询接口、以及输出网格的构造。
 
     ResampleWithDataSet() {
         SetNumberOfInputs(2);
@@ -181,7 +139,7 @@ private:
     }
     ~ResampleWithDataSet() override = default;
 
-    // 容差：默认自动（包围盒对角线 × kAutoToleranceRatio）
+    // 容差：默认自动（VTK 默认 = 包围盒对角线 × 1e-3）
     bool m_AutoTolerance{true};
     double m_Tolerance{-1.0};
     double m_EffectiveTolerance{0.0};

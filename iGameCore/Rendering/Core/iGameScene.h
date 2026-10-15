@@ -472,7 +472,7 @@ protected:
     GetShader(ShaderType type); //获取指定类型的着色器程序
     void
     UpdateModelsBoundingSphere(); //更新场景中所有可见模型的包围球(用于视锥剔除和相机定位)
-    void InitOpenGL();
+    bool InitOpenGL();
     void InitOIT();
     void InitAxes(); //初始化场景坐标轴
     void InitInterator();

@@ -1,20 +1,68 @@
-# 在系统环境变量里设置QT_HOME，值为Qt路径
-if (DEFINED ENV{QT_HOME})
-    set(Qt5_DIR "$ENV{QT_HOME}/5.15.2/msvc2019_64/lib/cmake/Qt5")
-else ()
-    # if complied in Linux,   set Qt5_DIR to e.g.(/usr/lib/Qt/5.14.2/gcc_64/lib/cmake/Qt5)
-    # if complied in Windows, set Qt5_DIR to e.g.(D:/Qt/5.14.2/msvc2017_64/lib/cmake/Qt5)
-    # set(Qt5_DIR "D:/Software/Qt/5.14.2/msvc2017_64/lib/cmake/Qt5")
-    # set(Qt5_DIR "F:/Qt/Qt5.14.2/5.14.2/msvc2017_64/lib/cmake/Qt5")
-    # set(Qt5_DIR "D:/Qt/5.14.2/msvc2017_64/lib/cmake/Qt5")
-    #set(Qt5_DIR "E:/Software/Visualsoft/Qt/Qt5.14.2/5.14.2/msvc2017_64/lib/cmake/Qt5")
-    #set(Qt5_DIR "D:/Qt/5.15.2/msvc2019_64/lib/cmake/Qt5")
-    set(Qt5_DIR "C:/Qt/5.15.2/msvc2019_64/lib/cmake/Qt5")
-    # set(Qt5_DIR "D:/Qt/5.14.2/msvc2017_64/lib/cmake/Qt5")
-endif ()
+# Respect an explicitly configured Qt5_DIR. Otherwise, look in the usual
+# platform locations, including Homebrew's keg-only Qt5 formula on macOS.
+if (NOT Qt5_DIR)
+    set(_qt5_config_candidates)
+    if (DEFINED ENV{QT_HOME} AND NOT "$ENV{QT_HOME}" STREQUAL "")
+        list(APPEND _qt5_config_candidates
+                "$ENV{QT_HOME}/lib/cmake/Qt5")
+        if (WIN32)
+            list(APPEND _qt5_config_candidates
+                    "$ENV{QT_HOME}/5.15.2/msvc2019_64/lib/cmake/Qt5")
+        elseif (APPLE)
+            list(APPEND _qt5_config_candidates
+                    "$ENV{QT_HOME}/5.15.2/clang_64/lib/cmake/Qt5")
+        elseif (UNIX)
+            list(APPEND _qt5_config_candidates
+                    "$ENV{QT_HOME}/5.15.2/gcc_64/lib/cmake/Qt5")
+        endif ()
+    endif ()
 
-if (UNIX)
-    set(Qt5_DIR "$ENV{HOME}/Qt5.14.2/5.14.2/gcc_64/lib/cmake/Qt5")
+    if (APPLE)
+        if (DEFINED ENV{HOMEBREW_PREFIX} AND NOT "$ENV{HOMEBREW_PREFIX}" STREQUAL "")
+            foreach (_qt_formula qt5 qt@5)
+                list(APPEND _qt5_config_candidates
+                        "$ENV{HOMEBREW_PREFIX}/opt/${_qt_formula}/lib/cmake/Qt5")
+            endforeach ()
+        endif ()
+
+        find_program(_homebrew_executable NAMES brew HINTS /opt/homebrew/bin /usr/local/bin)
+        if (_homebrew_executable)
+            foreach (_qt_formula qt5 qt@5)
+                execute_process(
+                        COMMAND "${_homebrew_executable}" --prefix "${_qt_formula}"
+                        RESULT_VARIABLE _qt_formula_result
+                        OUTPUT_VARIABLE _qt_formula_prefix
+                        OUTPUT_STRIP_TRAILING_WHITESPACE
+                        ERROR_QUIET)
+                if (_qt_formula_result EQUAL 0 AND _qt_formula_prefix)
+                    list(APPEND _qt5_config_candidates
+                            "${_qt_formula_prefix}/lib/cmake/Qt5")
+                endif ()
+            endforeach ()
+        endif ()
+
+        # Covers standard Apple Silicon and Intel Homebrew prefixes when CMake
+        # is run in an environment where brew is not on PATH.
+        list(APPEND _qt5_config_candidates
+                /opt/homebrew/opt/qt5/lib/cmake/Qt5
+                /opt/homebrew/opt/qt@5/lib/cmake/Qt5
+                /usr/local/opt/qt5/lib/cmake/Qt5
+                /usr/local/opt/qt@5/lib/cmake/Qt5)
+    elseif (WIN32)
+        list(APPEND _qt5_config_candidates
+                "C:/Qt/5.15.2/msvc2019_64/lib/cmake/Qt5")
+    endif ()
+
+    foreach (_qt5_candidate IN LISTS _qt5_config_candidates)
+        if (EXISTS "${_qt5_candidate}/Qt5Config.cmake")
+            set(Qt5_DIR "${_qt5_candidate}" CACHE PATH "Qt5 CMake package directory" FORCE)
+            message(STATUS "Using Qt5 CMake package: ${Qt5_DIR}")
+            break ()
+        endif ()
+    endforeach ()
+    unset(_qt5_config_candidates)
+    unset(_qt5_candidate)
+    unset(_homebrew_executable CACHE)
 endif ()
 
 set(MODULE_NAME Qt_module)
@@ -26,7 +74,7 @@ set(CMAKE_AUTOUIC ON) # UI files
 set(CMAKE_AUTOUIC_SEARCH_PATHS "${CMAKE_CURRENT_SOURCE_DIR}/Resources/UI")
 
 # 查找 Qt
-find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets OpenGL Charts Svg)
+find_package(Qt5 CONFIG REQUIRED COMPONENTS Core Gui Widgets OpenGL Charts Svg)
 Qt5_add_resources(QRC_FILES "Resources/iGameQtMainWindow.qrc")
 
 file(GLOB_RECURSE UI_FILES Resources/UI/*.ui)
