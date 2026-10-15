@@ -19,6 +19,46 @@ public:
     }
     int GetNumberOfEdges() override { return 4; }
 
+    /* ---------------- VTK 风格插值接口（对照 vtkLagrangeQuadrilateral / vtkHigherOrderQuadrilateral） -------- */
+    int GetParametricDimension() const noexcept override { return 2; }
+
+    // 等价 vtkHigherOrderQuadrilateral::GetParametricCenter：pcoords = (0.5, 0.5)
+    void GetParametricCenter(double pcoords[3]) const override {
+        pcoords[0] = 0.5;
+        pcoords[1] = 0.5;
+        pcoords[2] = 0.0;
+    }
+
+    int GetCellSize() const noexcept override {
+        const int n = static_cast<int>(this->m_Points->GetNumberOfPoints());
+        if (n > 0) { return n; }
+        return (m_Order > 0) ? (m_Order + 1) * (m_Order + 1) : 0;
+    }
+
+    int EffectiveOrder() const {
+        const int order = QuadOrderFromPointCount(this->GetCellSize());
+        return (order > 0) ? order : m_Order;
+    }
+
+    void InterpolationFunctions(const double pcoords[3], double* weights) const override {
+        const int order = this->EffectiveOrder();
+        if (order < 1 || weights == nullptr) { return; }
+        double derivs[512];
+        LagrangeTensor2(order, order, pcoords[0], pcoords[1], weights, derivs);
+    }
+
+    void InterpolationDerivs(const double pcoords[3], double* derivs) const override {
+        const int order = this->EffectiveOrder();
+        if (order < 1 || derivs == nullptr) { return; }
+        double shape[256];
+        LagrangeTensor2(order, order, pcoords[0], pcoords[1], shape, derivs);
+    }
+
+    int EvaluatePosition(const Point& x, Point& closestPoint, int& subId, double pcoords[3],
+                         double& dist2, double* weights) const override {
+        return this->EvaluatePositionNewton(x, closestPoint, subId, pcoords, dist2, weights);
+    }
+
     int GetEdgePointIds(const int edgeId, const igIndex*& ptIds) override {
         if (edgeId < 0 || edgeId >= 4) return 0;
         switch (m_Order) {

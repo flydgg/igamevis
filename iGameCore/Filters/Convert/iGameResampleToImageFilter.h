@@ -90,7 +90,8 @@ public:
     /// tol2 = vtkProbeFilter::CELL_TOLERANCE_FACTOR_SQR(1e-6) × 该单元自身包围盒对角线²，
     /// Tolerance 被忽略；为 false 时 tol2 = Tolerance²（VTK 中 Tolerance 默认 1.0）。
     /// 判定语义与 VTK 一致（vtkProbeFilter::ProbeImagePointsInCell）：
-    ///   - 先调用等价 vtkCell::EvaluatePosition 的定位，要求返回值 == 1（点在单元参数域内）；
+    ///   - 先调用单元类型自己的 VTK 复刻 EvaluatePosition 定位（经 ProbeFilter::EvaluateCell
+    ///     复用采样内核的单元求值；未实现插值的类型退化为角点线性），要求返回值 == 1；
     ///   - 三维单元（四面体 / 六面体）VTK 传 closestPoint = nullptr，dist2 保持初值 0，
     ///     因此 tol2 判定恒成立 —— 三维单元是否有效只取决于上面的「在单元内」判定；
     ///   - 0/1/2 维单元才会用「点到最近点的距离平方」与 tol2 比较；

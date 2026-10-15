@@ -16,6 +16,8 @@
 #include <iGameCellArray.h>
 #include <iGameCompositeDataObject.h>
 #include <iGameFlatArray.h>
+#include <iGameLagrangeLine.h>
+#include <iGameLagrangeQuadrilateral.h>
 #include <iGameLagrangeUnstructuredMesh.h>
 #include <iGameStructuredMesh.h>
 #include <iGameSurfaceMesh.h>
@@ -289,6 +291,7 @@ Cell* NativeCellForType(IGenum type) {
         Cell::Pointer vertex, line, triangle, quad, polygon, tetra, hexahedron, prism, pyramid;
         Cell::Pointer quadraticLine, quadraticTriangle, quadraticQuad, quadraticTetra,
                 quadraticHexahedron, quadraticPrism, quadraticPyramid;
+        Cell::Pointer lagrangeLine, lagrangeQuadrilateral;
     } cache;
 
     switch (type) {
@@ -340,6 +343,15 @@ Cell* NativeCellForType(IGenum type) {
         case IG_QUADRATIC_PYRAMID:
             if (cache.quadraticPyramid == nullptr) { cache.quadraticPyramid = QuadraticPyramid::New(); }
             return cache.quadraticPyramid.get();
+        // Lagrange：已按 VTK 语义实现插值的类型（其余 Lagrange 类型仍走角点线性退化）
+        case IG_LAGRANGE_CURVE:
+            if (cache.lagrangeLine == nullptr) { cache.lagrangeLine = LagrangeLine::New(); }
+            return cache.lagrangeLine.get();
+        case IG_LAGRANGE_QUADRILATERAL:
+            if (cache.lagrangeQuadrilateral == nullptr) {
+                cache.lagrangeQuadrilateral = LagrangeQuadrilateral::New();
+            }
+            return cache.lagrangeQuadrilateral.get();
         default:
             return nullptr;
     }

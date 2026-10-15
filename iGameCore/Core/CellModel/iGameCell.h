@@ -192,6 +192,113 @@ public:
 	 * 复用（等价 VTK 高阶单元用形函数 + 雅可比迭代求 pcoords 的实现）。
 	 * 收敛后用 [-kVTKParametricTol, 1+kVTKParametricTol] 判定参数域。
 	 */
+	/* ---------------- VTK 风格 Lagrange 插值辅助 ----------------
+	 * 逐行对照 vtkLagrangeInterpolation / vtkHigherOrderInterpolation：
+	 * 参考节点等距，且 1D 基的索引顺序是「两端点在前、内部点在后」（等价 Tensor1ShapeFunctions）。
+	 * 注意：VTK 的 Tensor1ShapeDerivatives 未做同样的重排（与自身形函数不自洽），这里为保证
+	 * Newton 反解的一致性对导数做**与形函数相同**的重排（数学上正确）。
+	 */
+	static void LagrangeShape1D(int order, double t, double* shape) {
+		const double v = order * t;
+		for (int j = 0; j <= order; ++j) {
+			shape[j] = 1.0;
+			for (int k = 0; k <= order; ++k) {
+				if (j != k) { shape[j] *= (v - k) / (j - k); }
+			}
+		}
+	}
+
+	static void LagrangeShapeAndGradient1D(int order, double t, double* shape, double* derivs) {
+		const double v = order * t;
+		for (int j = 0; j <= order; ++j) {
+			shape[j] = 1.0;
+			derivs[j] = 0.0;
+			for (int k = 0; k <= order; ++k) {
+				if (j == k) { continue; }
+				shape[j] *= (v - k) / (j - k);
+				double dtmp = 1.0;
+				for (int q = 0; q <= order; ++q) {
+					if (q == j) { continue; }
+					dtmp *= (q == k ? 1.0 : (v - q)) / (j - q);
+				}
+				derivs[j] += order * dtmp;
+			}
+		}
+	}
+
+	/** 1D（曲线）：等价 Tensor1ShapeFunctions，形函数与导数一起重排 */
+	static int LagrangeTensor1(int order, double t, double* shape, double* derivs) {
+		double ll[64], dd[64];
+		if (order < 1 || order > 63) { return 0; }
+		LagrangeShapeAndGradient1D(order, t, ll, dd);
+		int sn = 0;
+		shape[sn] = ll[0];
+		derivs[sn] = dd[0];
+		++sn;
+		shape[sn] = ll[order];
+		derivs[sn] = dd[order];
+		++sn;
+		for (int i = 1; i < order; ++i) {
+			shape[sn] = ll[i];
+			derivs[sn] = dd[i];
+			++sn;
+		}
+		return sn;
+	}
+
+	/**
+	 * 2D 四边形：等价 Tensor2ShapeFunctions / Tensor2ShapeDerivatives，节点序为
+	 * 「4 角点 → 各棱内部点（0-1、1-2、2-3、3-0）→ 面内部点」。
+	 * 导数输出为本仓库布局：前 n 项 ∂N/∂r，后 n 项 ∂N/∂s。
+	 */
+	static int LagrangeTensor2(int orderR, int orderS, double r, double s, double* shape, double* derivs) {
+		if (orderR < 1 || orderS < 1 || orderR > 15 || orderS > 15) { return 0; }
+		double ll0[16], ll1[16], dd0[16], dd1[16];
+		LagrangeShapeAndGradient1D(orderR, r, ll0, dd0);
+		LagrangeShapeAndGradient1D(orderS, s, ll1, dd1);
+
+		double dv[512];
+		const auto put = [&](int pos, int i0, int i1) {
+			shape[pos] = ll0[i0] * ll1[i1];
+			dv[2 * pos] = dd0[i0] * ll1[i1];
+			dv[2 * pos + 1] = ll0[i0] * dd1[i1];
+		};
+
+		put(0, 0, 0);
+		put(1, orderR, 0);
+		put(2, orderR, orderS);
+		put(3, 0, orderS);
+
+		int sn = 4;
+		int sn1 = 4 + orderR + orderS - 2;
+		for (int i = 1; i < orderR; ++i) {
+			put(sn++, i, 0);		// 棱 0-1
+			put(sn1++, i, orderS);  // 棱 2-3
+		}
+		for (int i = 1; i < orderS; ++i) {
+			put(sn++, orderR, i);   // 棱 1-2
+			put(sn1++, 0, i);	   // 棱 3-0
+		}
+		sn = sn1;
+		for (int i = 1; i < orderS; ++i) {
+			for (int j = 1; j < orderR; ++j) { put(sn++, j, i); }
+		}
+		const int n = sn;
+		for (int i = 0; i < n; ++i) {
+			derivs[i] = dv[2 * i];
+			derivs[n + i] = dv[2 * i + 1];
+		}
+		return n;
+	}
+
+	/** 四边形：由点数反推阶数（n = (p+1)²，等价 VTK 的 GetNumberOfPoints 反推） */
+	static int QuadOrderFromPointCount(int n) {
+		for (int p = 1; p <= 15; ++p) {
+			if ((p + 1) * (p + 1) == n) { return p; }
+		}
+		return -1;
+	}
+
 	int EvaluatePositionNewton(const Point& x, Point& closestPoint, int& subId,
 	                          double pcoords[3], double& dist2, double* weights) const {
 		subId = 0;
