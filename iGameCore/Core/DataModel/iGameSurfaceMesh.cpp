@@ -848,7 +848,6 @@ void SurfaceMesh::GetDrawableArray(FloatArray::Pointer& positions, UnsignedIntAr
                                    UnsignedIntArray::Pointer& triangleIndices,
                                    UnsignedCharArray::Pointer& triangleEdgeMasks) {
     Timer::Pointer timer = Timer::New();
-
     positions = m_Points->ConvertToArray();
 
     lineIndices->Reset();
@@ -863,7 +862,12 @@ void SurfaceMesh::GetDrawableArray(FloatArray::Pointer& positions, UnsignedIntAr
     // Surface rendering does not consume the explicit edge list. Build it
     // lazily when wireframe is requested; SetViewStyle marks the draw data
     // dirty so switching representation later remains correct.
-    const bool needLineIndices = NeedsExplicitWireframeGeometry(m_ViewStyle);
+    //
+    // 注意：NeedsExplicitWireframeGeometry 对本地（非远端）对象恒为 true（历史上是为了
+    // “加载时就把显式边表准备好”），若只看它，纯表面/点云视图也会白建一份 3M 级边表。
+    // 这里再要求视图样式里确实带线框位；切换到线框时 SetViewStyle 会标脏并重建。
+    const bool needLineIndices =
+            NeedsExplicitWireframeGeometry(m_ViewStyle) && (m_ViewStyle & IG_WIREFRAME) != 0;
     if (needLineIndices && this->GetEdges() == nullptr) { this->BuildEdges(); }
 
     if (m_Clipper->IsAllDisable()) {

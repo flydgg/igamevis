@@ -194,7 +194,8 @@ bool DrawObject::NeedsExplicitWireframeGeometry(IGenum viewStyle) {
 }
 
 void DrawObject::MarkWireframeGeometryDirtyIfNeeded(IGenum viewStyle) {
-    if (!m_RemoteRenderingEnabled) return;
+    // 本地对象也要在“切到需要显式边表的视图”时标脏：边表现在是惰性构建的
+    // （见 SurfaceMesh::GetDrawableArray），否则切到线框后线表为空、线框画不出来。
     // Composite parents only forward state, and shell-rendered sources forward
     // drawing to their SurfaceMesh. Mark only the leaf owning the draw arrays.
     if (this->HasSubDataObject() || m_RenderableMesh.SurfaceMesh) { return; }
@@ -599,15 +600,18 @@ void DrawObject::SetRenderableObject(DataObject::Pointer dataObject) {
     m_RenderableMesh.SimplifiedMesh = nullptr;
 #ifndef __EMSCRIPTEN__
     constexpr IGsize maxAutomaticLodFaces = 20000000;
+    // 自动交互 LOD 用的是二次误差简化（MeshSimplificationFilterPro），成本随面数增长很快：
+    // 200 万面级网格在显示路径上同步简化会卡住数分钟（首帧一直不出现）。因此只在
+    // 能“秒级完成”的规模内自动构建，更大的网格先直接显示全分辨率（SetAutoBuildInteractionLod
+    // 仍可显式开启；后续可改为后台线程构建后再替换）。
+    constexpr IGsize synchronousLodFaceLimit = 1000000;
     auto surfaceMesh = DynamicCast<SurfaceMesh>(dataObject);
     if (m_AutoBuildInteractionLod && m_ShellRendering && surfaceMesh != nullptr &&
-        surfaceMesh->GetNumberOfFaces() > 1000000) {
-        if (surfaceMesh->GetNumberOfFaces() <= maxAutomaticLodFaces) {
-            BuildSimplifiedRenderableObject();
-        } else {
-            IGAME_RENDERING_INFO("{}: automatic interaction LOD skipped for {} faces (limit {}); interaction retains the full-resolution mesh.",
-                                surfaceMesh->GetName(), surfaceMesh->GetNumberOfFaces(), maxAutomaticLodFaces);
-        }
+        surfaceMesh->GetNumberOfFaces() > synchronousLodFaceLimit) {
+        IGAME_RENDERING_INFO(
+                "{}: automatic interaction LOD skipped on the display path for {} faces (> {}); "
+                "showing the full-resolution mesh instead.",
+                surfaceMesh->GetName(), surfaceMesh->GetNumberOfFaces(), synchronousLodFaceLimit);
     }
 #endif
 
