@@ -1251,7 +1251,20 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
         }
 
         // 1) 上一个命中单元作为提示（VTK 的 FindCell(x, lastCellId)）
-        if (lastCellId >= 0 && lastCellId < cellNum && !IsBlankedCell(ghost, lastCellId)) {
+        //    先用该单元的包围盒做保守预判：随机/低相干点集上提示多半无效，
+        //    跳过这次完整的 EvaluatePosition（与扫描循环用同一判据，语义等价）。
+        bool hintInBox = true;
+        if (gridPtr->Valid() && lastCellId >= 0 && lastCellId < cellNum) {
+            const double* hintBox = &gridPtr->boxes[static_cast<size_t>(lastCellId) * 6];
+            const double hintPad = snapping ? ((options.snappingRadius > 0.0) ? options.snappingRadius : tol) : tol;
+            hintInBox = !(static_cast<double>(p[0]) < hintBox[0] - hintPad ||
+                          static_cast<double>(p[0]) > hintBox[3] + hintPad ||
+                          static_cast<double>(p[1]) < hintBox[1] - hintPad ||
+                          static_cast<double>(p[1]) > hintBox[4] + hintPad ||
+                          static_cast<double>(p[2]) < hintBox[2] - hintPad ||
+                          static_cast<double>(p[2]) > hintBox[5] + hintPad);
+        }
+        if (hintInBox && lastCellId >= 0 && lastCellId < cellNum && !IsBlankedCell(ghost, lastCellId)) {
             CellEval hint;
             const int rc = EvaluateCellAt(mesh, lastCellId, p, hint, weightsScratch);
             // 与 VTK 一致：0/1/2 维单元的「参数域内」不足以判定命中，距离还必须在容差内
