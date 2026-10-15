@@ -774,45 +774,6 @@ bool VTKAbstractReader::ProcessMetaData() {
     }
     return true;
 }
-int VTKAbstractReader::ReadCellsWithOffsetType(int& CellsNum, ArrayObject::Pointer& CellsId,
-                                               ArrayObject::Pointer& CellsConnect) {
-    int offsetsSize{0};
-    int connSize{0};
-    char buffer[256];
-    if (!(this->Read(&offsetsSize) && this->Read(&connSize))) {
-        igError("Error while reading cell array header.");
-        return 0;
-    }
-    if (offsetsSize < 1) { return 1; }
-    CellsNum = offsetsSize - 1;
-    if (!this->ReadString(buffer) ||                                                           // "offsets"
-        (strcmp(this->LowerCase(buffer, 256), "offsets") != 0) || !this->ReadString(buffer)) { // datatype
-        igError("Error reading cell array offset header.");
-        return 0;
-    }
-
-    this->LowerCase(buffer, 256);
-    CellsId = this->ReadArray(buffer, offsetsSize, 1);
-    if (!CellsId) {
-        igError("Error reading cell array offset data.");
-        return 0;
-    }
-    if (!this->ReadString(buffer) ||                                                              // "connectivity"
-        (strcmp(this->LowerCase(buffer, 256), "connectivity") != 0) || !this->ReadString(buffer)) // datatype
-    {
-        igError("Error reading cell array connectivity header.");
-        return 0;
-    }
-    this->LowerCase(buffer, 256);
-    CellsConnect = this->ReadArray(buffer, connSize, 1);
-    if (!CellsConnect) {
-        igError("Error reading cell array connectivity data.");
-        return 0;
-    }
-    this->UpdateReadProgress();
-    return 1;
-}
-
 namespace {
 /** 跳过 ASCII 空白后判断下一个 token 是否等于 kw（只读，不移动读取指针） */
 bool PeekTokenIs(const char* is, const char* end, const char* kw) {
@@ -827,6 +788,110 @@ bool PeekTokenIs(const char* is, const char* end, const char* kw) {
     return true;
 }
 } // namespace
+
+int VTKAbstractReader::ReadCellsWithOffsetType(int& CellsNum, ArrayObject::Pointer& CellsId,
+                                               ArrayObject::Pointer& CellsConnect) {
+    int cellCount{0};
+    int connSize{0};
+    char buffer[256];
+    if (!(this->Read(&cellCount) && this->Read(&connSize))) {
+        igError("Error while reading cell array header.");
+        return 0;
+    }
+    if (cellCount < 2) { return 1; }
+    // 实测（VTK 5.1 新式布局）：头部第一个数是 **OFFSETS 个数**，而 offsets 数组有 ncells+1 项，
+    // 因此 ncells = offsetsCount - 1；offsets 末项等于 connectivity 个数。
+    CellsNum = cellCount - 1;
+    if (!this->ReadString(buffer) ||                                                           // "offsets"
+        (strcmp(this->LowerCase(buffer, 256), "offsets") != 0) || !this->ReadString(buffer)) { // datatype
+        igError("Error reading cell array offset header.");
+        return 0;
+    }
+    this->LowerCase(buffer, 256); // 数据类型 token（vtkIdType / vtktypeint64 / int …）
+    const char* offsetsData = this->IS;
+
+    // 稳健性：token 未必等于实际存储宽度（有的写出器标 vtkIdType 却存 4 字节）。
+    // 先按框架既有的 4 字节 vtkidtype 路径读，再用「起点 0、单调不减、末位==连接数」校验；
+    // 不通过则回到数据起点按 8 字节重读（文件在内存缓冲里，可直接回退）。
+    int idWidth = 4;
+    CellsId = this->ReadArray(buffer, cellCount, 1);
+    if (CellsId == nullptr || !OffsetsLookSane(CellsId, CellsNum, connSize)) {
+        idWidth = 8;
+        this->IS = offsetsData;
+        CellsId = this->ReadIdArrayWithElementSize(cellCount, idWidth);
+        if (CellsId == nullptr || !OffsetsLookSane(CellsId, CellsNum, connSize)) {
+            igError("Error reading cell array offset data (unsupported id width).");
+            return 0;
+        }
+    }
+
+    if (!this->ReadString(buffer) ||                                                              // "connectivity"
+        (strcmp(this->LowerCase(buffer, 256), "connectivity") != 0) || !this->ReadString(buffer)) // datatype
+    {
+        igError("Error reading cell array connectivity header.");
+        return 0;
+    }
+    this->LowerCase(buffer, 256);
+    CellsConnect = (idWidth == 4) ? this->ReadArray(buffer, connSize, 1)
+                                  : this->ReadIdArrayWithElementSize(connSize, idWidth);
+    if (!CellsConnect) {
+        igError("Error reading cell array connectivity data.");
+        return 0;
+    }
+    this->UpdateReadProgress();
+    return 1;
+}
+
+/** offsets 合理性校验：起点为 0、单调不减、末位等于连接数（连接数未知时只做前两项） */
+bool VTKAbstractReader::OffsetsLookSane(ArrayObject::Pointer ids, int cellCount, int connSize) const {
+    if (ids == nullptr || ids->GetNumberOfElements() < static_cast<IGsize>(cellCount) + 1) { return false; }
+    double prev = ids->GetElementValue(0, 0);
+    if (prev != 0.0) { return false; }
+    for (int i = 1; i <= cellCount; ++i) {
+        const double v = ids->GetElementValue(i, 0);
+        if (v < prev) { return false; }
+        prev = v;
+    }
+    if (connSize > 0 && static_cast<int>(prev) != connSize) { return false; }
+    return true;
+}
+
+/** 按指定元素宽度（4 / 8 字节，大端）读取 id 数组 → IntArray（超出 int 范围的值按 int 截断） */
+ArrayObject::Pointer VTKAbstractReader::ReadIdArrayWithElementSize(int count, int width) {
+    if (count <= 0) { return IntArray::New(); }
+    const size_t elemBytes = static_cast<size_t>(width);
+    const size_t want = elemBytes * static_cast<size_t>(count);
+    if (this->IS == nullptr || this->FILEEND == nullptr || static_cast<size_t>(this->FILEEND - this->IS) < want) {
+        igError("Id array data truncated!");
+        return nullptr;
+    }
+    std::vector<unsigned char> raw(want);
+    if (!this->Read(reinterpret_cast<char*>(raw.data()), want)) { return nullptr; }
+
+    auto arr = IntArray::New();
+    arr->Resize(static_cast<IGsize>(count));
+    int* out = arr->RawPointer();
+    for (int i = 0; i < count; ++i) {
+        const unsigned char* p = raw.data() + elemBytes * static_cast<size_t>(i);
+        if (width == 8) {
+            const unsigned long long v = (static_cast<unsigned long long>(p[0]) << 56) |
+                                         (static_cast<unsigned long long>(p[1]) << 48) |
+                                         (static_cast<unsigned long long>(p[2]) << 40) |
+                                         (static_cast<unsigned long long>(p[3]) << 32) |
+                                         (static_cast<unsigned long long>(p[4]) << 24) |
+                                         (static_cast<unsigned long long>(p[5]) << 16) |
+                                         (static_cast<unsigned long long>(p[6]) << 8) |
+                                         static_cast<unsigned long long>(p[7]);
+            out[i] = static_cast<int>(v);
+        } else {
+            const unsigned int v = (static_cast<unsigned int>(p[0]) << 24) |
+                                   (static_cast<unsigned int>(p[1]) << 16) |
+                                   (static_cast<unsigned int>(p[2]) << 8) | static_cast<unsigned int>(p[3]);
+            out[i] = static_cast<int>(v);
+        }
+    }
+    return arr;
+}
 
 int VTKAbstractReader::ReadCellsWithCellSizeType(int CellNum, int size, ArrayObject::Pointer& CellsId,
                                                  ArrayObject::Pointer& CellsConnect) {
@@ -956,7 +1021,9 @@ bool VTKAbstractReader::ReadUnstructuredGrid() {
             // 原先二进制分支无条件走 OFFSETS，遇到经典二进制文件会报错甚至越界崩溃。
             const auto tCells = std::chrono::steady_clock::now();
             const char* tmpIS = this->IS;
-            if (!(this->Read(&ncells))) {
+            // 新式布局是「CELLS <offsets个数> <连接个数>」后紧跟 OFFSETS 关键字，
+            // 经典布局是「CELLS <单元数> <size>」后直接跟数据 —— 必须先读完两个数再判断。
+            if (!(this->Read(&ncells) && this->Read(&size))) {
                 igError("Cannot read cells!");
                 return false;
             }
@@ -964,9 +1031,6 @@ bool VTKAbstractReader::ReadUnstructuredGrid() {
             if (offsetStyle) {
                 this->IS = tmpIS; // ReadCellsWithOffsetType 期望从 "CELLS" 之后开始
                 if (!this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect)) { return false; }
-            } else if (!this->Read(&size)) {
-                igError("Cannot read cells!");
-                return false;
             } else if (this->m_FileType == IGAME_BINARY) {
                 // 「CELLS n size」头之后是行尾空白，再往后才是二进制数据块
                 this->SkipNullData();
@@ -1063,43 +1127,48 @@ bool VTKAbstractReader::ReadSurfaceMesh() {
         } 
           
         else if (!strncmp(line, "lines", 5)) {
-            if (this->m_FileType == IGAME_BINARY) {
-                this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect);
-            } else {
-                const char* tmpIS = this->IS;
-                if (!(this->Read(&ncells) && this->Read(&size))) {
-                    igError("Cannot read cells!");
-                    return false;
-                }
+            // 两种文件类型都区分「新式 OFFSETS/CONNECTIVITY」与「经典 n size + 连续数据」：
+            // 原先二进制分支无条件走 OFFSETS（经典二进制 POLYDATA 会报错甚至越界崩溃），
+            // ASCII 分支用 mAtoi 读 "OFFSETS" 还会越界访问数字表。
+            const char* tmpIS = this->IS;
+            // 新式布局是「<段名> <offsets个数> <连接个数>」后紧跟 OFFSETS 关键字，
+            // 经典布局是「<段名> <单元数> <size>」后直接跟数据 —— 必须先读完两个数再判断。
+            if (!(this->Read(&ncells) && this->Read(&size))) {
+                igError("Cannot read cells!");
+                return false;
+            }
+            if (PeekTokenIs(this->IS, this->FILEEND, "offsets")) {
+                this->IS = tmpIS;
+                if (!this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect)) { return false; }
+            } else if (this->m_FileType == IGAME_BINARY) {
                 this->SkipNullData();
-                if (strncmp(this->IS, "OFFSETS", 7) == 0) {
-                    this->IS = tmpIS;
-                    this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect);
-                } else {
-                    this->ReadCellsWithCellSizeType(ncells, size, CellsId, CellsConnect);
-                }
+                if (!this->ReadCellsWithCellSizeTypeBinary(ncells, size, CellsId, CellsConnect)) { return false; }
+            } else {
+                if (!this->ReadCellsWithCellSizeType(ncells, size, CellsId, CellsConnect)) { return false; }
             }
             m_SurfaceMesh->SetEdges(this->CreateCellArray(CellsId, CellsConnect));
         }
         
         
         else if (!strncmp(line, "polygons", 8)) {
-
-            if (this->m_FileType == IGAME_BINARY) {
-                this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect);
-            } else {
-                const char* tmpIS = this->IS;
-                if (!(this->Read(&ncells) && this->Read(&size))) {
-                    igError("Cannot read cells!");
-                    return false;
-                }
+            // 两种文件类型都区分「新式 OFFSETS/CONNECTIVITY」与「经典 n size + 连续数据」：
+            // 原先二进制分支无条件走 OFFSETS（经典二进制 POLYDATA 会报错甚至越界崩溃），
+            // ASCII 分支用 mAtoi 读 "OFFSETS" 还会越界访问数字表。
+            const char* tmpIS = this->IS;
+            // 新式布局是「<段名> <offsets个数> <连接个数>」后紧跟 OFFSETS 关键字，
+            // 经典布局是「<段名> <单元数> <size>」后直接跟数据 —— 必须先读完两个数再判断。
+            if (!(this->Read(&ncells) && this->Read(&size))) {
+                igError("Cannot read cells!");
+                return false;
+            }
+            if (PeekTokenIs(this->IS, this->FILEEND, "offsets")) {
+                this->IS = tmpIS;
+                if (!this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect)) { return false; }
+            } else if (this->m_FileType == IGAME_BINARY) {
                 this->SkipNullData();
-                if (strncmp(this->IS, "OFFSETS", 7) == 0) {
-                    this->IS = tmpIS;
-                    this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect);
-                } else {
-                    this->ReadCellsWithCellSizeType(ncells, size, CellsId, CellsConnect);
-                }
+                if (!this->ReadCellsWithCellSizeTypeBinary(ncells, size, CellsId, CellsConnect)) { return false; }
+            } else {
+                if (!this->ReadCellsWithCellSizeType(ncells, size, CellsId, CellsConnect)) { return false; }
             }
             m_SurfaceMesh->SetFaces(this->CreateCellArray(CellsId, CellsConnect));
         } else if (!strncmp(line, "cell_data", 9)) {

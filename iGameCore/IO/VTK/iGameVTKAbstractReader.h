@@ -99,6 +99,10 @@ public:
 	int ReadLutData();
 	//read cells with offset type, that means cells load with cellId(offset) and cell connectivity
 	int ReadCellsWithOffsetType(int& CellNum,ArrayObject::Pointer& CellsId, ArrayObject::Pointer& CellsConnect);
+	/** offsets 合理性校验：起点 0、单调不减、末位==连接数 */
+	bool OffsetsLookSane(ArrayObject::Pointer ids, int cellCount, int connSize) const;
+	/** 按 4/8 字节（大端）读 id 数组 → IntArray */
+	ArrayObject::Pointer ReadIdArrayWithElementSize(int count, int width);
 	//read cells with offset type, that means cells load with cellsize and cell vert set
 	int ReadCellsWithCellSizeType(int CellNum,int size, ArrayObject::Pointer& CellsId, ArrayObject::Pointer& CellsConnect);
 	// 经典格式「CELLS n size」的二进制版本（大端 int32 连续块，一次读入再切分）
