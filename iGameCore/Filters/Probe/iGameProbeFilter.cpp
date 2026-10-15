@@ -1004,8 +1004,22 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
                                  std::vector<unsigned char>* validMask) {
     out.assign(positions.size(), SampleLocation{});
     if (validMask != nullptr) { validMask->assign(positions.size(), 0); }
+    return LocatePositionsRange(mesh, positions, 0, positions.size(), options, out, validMask);
+}
+
+bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
+                                       const std::vector<Point>& positions,
+                                       size_t begin,
+                                       size_t end,
+                                       const ProbeOptions& options,
+                                       std::vector<SampleLocation>& out,
+                                       std::vector<unsigned char>* validMask) {
     if (mesh.IsNull() || mesh->GetNumberOfCells() == 0) { return false; }
     if (positions.empty()) { return true; }
+    // 调用方负责预分配；越界/非法范围直接视为无事可做
+    if (out.size() < positions.size()) { return false; }
+    if (validMask != nullptr && validMask->size() < positions.size()) { return false; }
+    if (begin >= end || end > positions.size()) { return true; }
 
     const double tol = (options.tolerance < 0.0) ? DefaultTolerance(mesh) : options.tolerance;
     const double tol2 = tol * tol;
@@ -1286,18 +1300,21 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
         }
     };
 
-    // 单位置循环；样本多且源网格可并行时按线程分块（每块独立 scratch，写 out 的互不相交下标）
-    const size_t sampleCount = positions.size();
+    // 单位置循环；只处理 [begin, end) 这一段（范围式 API 让调用方复用结果缓冲，
+    // 分块上报进度时不再需要把每块的 SampleLocation 逐元素拷回总缓冲）。
+    const size_t rangeCount = end - begin;
     const bool parallel = options.useParallel && !unsafeForParallel &&
-                          sampleCount >= static_cast<size_t>(kSampleParallelThreshold);
+                          rangeCount >= static_cast<size_t>(kSampleParallelThreshold);
     if (parallel) {
-        ParallelChunks(static_cast<int>(sampleCount), [&](int begin, int end) {
+        ParallelChunks(static_cast<int>(rangeCount), [&](int chunkBegin, int chunkEnd) {
             LocateScratch scratch;
-            for (int k = begin; k < end; ++k) { locateOne(static_cast<size_t>(k), scratch); }
+            for (int k = chunkBegin; k < chunkEnd; ++k) {
+                locateOne(begin + static_cast<size_t>(k), scratch);
+            }
         });
     } else {
         LocateScratch scratch;
-        for (size_t i = 0; i < sampleCount; ++i) { locateOne(i, scratch); }
+        for (size_t i = begin; i < end; ++i) { locateOne(i, scratch); }
     }
     return true;
 }

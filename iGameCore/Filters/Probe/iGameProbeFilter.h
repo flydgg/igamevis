@@ -160,6 +160,19 @@ public:
                                 std::vector<unsigned char>* validMask = nullptr);
 
     /**
+     * 范围式批量定位：out/validMask 由调用方按 positions.size() 预分配（并已完成初始化），
+     * 内核只写 [begin, end) 这一段，不产生任何逐元素拷贝。
+     * 供「分块上报进度」「多次复用同一结果缓冲」的调用方使用（LocatePositions 即其特例）。
+     */
+    static bool LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
+                                     const std::vector<Point>& positions,
+                                     size_t begin,
+                                     size_t end,
+                                     const ProbeOptions& options,
+                                     std::vector<SampleLocation>& out,
+                                     std::vector<unsigned char>* validMask = nullptr);
+
+    /**
      * 批量属性（把数组追加到 outSet，VTK 语义）：
      *   - 源点数据插值（保留源数组类型；无效采样点填 0）；
      *   - 源单元数据按命中单元整段拷到**输出点数据**（同名时点数据优先；无效点填 0）；

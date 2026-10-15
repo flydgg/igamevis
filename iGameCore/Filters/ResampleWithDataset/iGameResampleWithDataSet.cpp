@@ -360,24 +360,17 @@ bool ResampleWithDataSet::Execute() {
     // 分块调用内核对进度友好：每块内部仍然走并行（ParallelChunks），块之间上报一次进度。
     // 块数按采样点数自适应，样本少时只有 1 块，行为与单次调用完全一致。
     const int progressBlocks = std::min(32, std::max(1, sampleNum / 4096));
-    {
-        std::vector<Point> blockPositions;
-        std::vector<ProbeFilter::SampleLocation> blockLocations;
-        std::vector<unsigned char> blockMask;
-        for (int block = 0; block < progressBlocks; ++block) {
-            const int begin = static_cast<int>(static_cast<long long>(sampleNum) * block / progressBlocks);
-            const int end = static_cast<int>(static_cast<long long>(sampleNum) * (block + 1) / progressBlocks);
-            blockPositions.assign(positions.begin() + begin, positions.begin() + end);
-            if (!ProbeFilter::LocatePositions(mesh, blockPositions, options, blockLocations, &blockMask)) {
-                m_Message = "「被采样网格」定位失败";
-                return false;
-            }
-            std::copy(blockLocations.begin(), blockLocations.end(), kernelLocations.begin() + begin);
-            std::copy(blockMask.begin(), blockMask.end(), validMask.begin() + begin);
-            reportProgress(0.05 + 0.60 * (block + 1) / progressBlocks,
-                           "重采样：定位采样点 " + std::to_string(block + 1) + "/" +
-                                   std::to_string(progressBlocks));
+    for (int block = 0; block < progressBlocks; ++block) {
+        const size_t begin = static_cast<size_t>(static_cast<long long>(sampleNum) * block / progressBlocks);
+        const size_t end = static_cast<size_t>(static_cast<long long>(sampleNum) * (block + 1) / progressBlocks);
+        // 范围式内核：结果直接写进预分配的总缓冲，不做逐元素回填（SampleLocation 约 2 KB/点）
+        if (!ProbeFilter::LocatePositionsRange(mesh, positions, begin, end, options, kernelLocations, &validMask)) {
+            m_Message = "「被采样网格」定位失败";
+            return false;
         }
+        reportProgress(0.05 + 0.60 * (block + 1) / progressBlocks,
+                       "重采样：定位采样点 " + std::to_string(block + 1) + "/" +
+                               std::to_string(progressBlocks));
     }
 
     m_SampleCellIds.assign(static_cast<size_t>(sampleNum), -1);
