@@ -13,6 +13,7 @@
 
 #include <iGameThreadPool.h>
 #include <iGameAttributeSet.h>
+#include <iGamePolyLine.h>
 #include <iGameCellArray.h>
 #include <iGameCompositeDataObject.h>
 #include <iGameFlatArray.h>
@@ -411,6 +412,8 @@ void ParallelChunks(int sampleCount, Func&& process) {
 }
 
 bool RequiresMeshCell(IGenum type) {
+    // 折线由内核的每线程 PolyLine 承担（点数由网格给定），不再依赖 mesh 的共享缓存单元
+    if (type == IG_POLY_LINE) { return false; }
     if (NativeCellForType(type) != nullptr) { return false; }
     const IGenum linear = LinearTypeFor(type);
     return !(linear != IG_NONE && NativeCellForType(linear) != nullptr);
@@ -456,12 +459,20 @@ Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& 
         }
     }
 
-    // 2) 需要面拓扑的类型（Polyhedron）：沿用 mesh 内部构造好的单元对象
+    // 2) 折线：用内核每线程 PolyLine（点数由网格给定；等价 vtkPolyLine 的按段求值）
+    if (type == IG_POLY_LINE) {
+        thread_local PolyLine::Pointer s_polyLine = PolyLine::New();
+        FillKernelCell(s_polyLine.GetPointer(), mesh, ptIds, npts);
+        nptsOut = npts;
+        return s_polyLine.GetPointer();
+    }
+
+    // 3) 需要面拓扑的类型（Polyhedron）：沿用 mesh 内部构造好的单元对象
     if (Cell* meshCell = mesh->GetCell(cellId); meshCell != nullptr && meshCell->GetCellType() != IG_EMPTY_CELL) {
         return meshCell;
     }
 
-    // 3) 退化：前 N 个角点的线性单元
+    // 4) 退化：前 N 个角点的线性单元
     const IGenum linear = LinearTypeFor(type);
     Cell* fallback = (linear == IG_NONE) ? nullptr : NativeCellForType(linear);
     if (fallback == nullptr) { return mesh->GetCell(cellId); }
