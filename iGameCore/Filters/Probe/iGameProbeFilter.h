@@ -16,12 +16,32 @@
 //   f->Execute();
 //   auto result = f->GetOutput();  // 与 queryPts 为同一对象
 //
-// 算法（v1）:
-//   1. 对每个查询点遍历模型单元（面网格只查面单元、体网格只查体单元），
-//      调用 EvaluatePosition 判定；v1 仅支持三角形 / 四面体，其余类型未命中；
-//   2. 命中后按重心坐标对模型全部点属性做线性插值，写入查询点；
-//   3. 新增点属性 ValidPointMask：找到单元 = 1，未找到 = 0；
-//      未找到单元时插值属性填 0；
+// 采样内核（本类同时也是所有重采样滤波共用的唯一内核）:
+//   空间索引   CSR 均匀网格（按包围盒长宽比与单元数自动定分辨率，扁平候选表 + 每体素区间）
+//   定位       单元类型自己的 VTK 复刻 EvaluatePosition（复刻 vtkCell 与各 vtkXxx）；
+//              上一个命中单元作为提示（等价 vtkProbeFilter 的 FindCell(x, lastCellId)）；
+//              环形候选 + 去重戳 + 单元 AABB 预判 + 源包围盒预判
+//   命中判定   等价 vtkDataSet::FindCell(x, tol2)：参数域内**且** dist2 ≤ tol2
+//              （三维单元域内 dist2 = 0，于是退化为「是否在单元内」；0/1/2 维单元还要看距离）
+//   容差       默认 = 源包围盒对角线 × 1e-3（等价 vtkProbeFilter 的 tol2 = 对角线² × 1e-6）
+//   吸附       可选 SnapToCellWithClosestPoint + SnappingRadius（VTK 语义）
+//   退化       尚未实现插值的类型（部分高阶 / Lagrange / QuadraticPolygon）退化为
+//              「前 N 个角点」的线性单元，并在 SampleLocation::degraded 标记
+//   ghost      跳过 vtkGhostType 中 HIDDENCELL | DUPLICATECELL 的单元
+//   属性       源点数据插值（保留数组类型）+ 源单元数据按命中单元拷到输出点数据
+//              （VTK InputCellArrays，同名点数据优先）+ 掩膜；无效点各属性填 0
+//   并行       样本数 ≥ 1024 且源网格不含「只能用共享单元对象」的类型时按线程分块定位
+//              （结果与串行 bitwise 一致；lastCell 只是提示，命中判定与顺序无关）
+//
+//   对外批量 API（重采样滤波直接调用，避免各自重写定位/插值）:
+//     BuildSourceMesh / LocatePositions / InterpolateAttributes / EvaluateCell /
+//     DefaultTolerance / CreateArrayObject / SourceTypeName
+//
+// Execute() 的行为（保持交互层不变的约定）:
+//   1. 定位查询点（上述内核）；
+//   2. 命中后对模型全部点属性做线性插值，写回查询点集（原地，GetOutput() == 输入 1）；
+//   3. 点属性 ValidPointMask（**IntArray**，供 igQtProbeWidget 使用）：命中 = 1，未命中 = 0，
+//      未命中时插值属性填 0；
 //   4. 模型无属性 / 无单元不报错，流程照常执行。
 //
 // 球体随机采样（交互层使用）:

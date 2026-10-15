@@ -37,6 +37,8 @@
 
 ## 容差与无效点
 
+- **命中判定与 VTK 一致**：参数域内**且** `dist2 ≤ tol2` 才算命中（三维单元域内 `dist2 = 0`，
+  0/1/2 维单元还要看点到单元的距离）。
 - **自动容差**（默认），与 `vtkProbeFilter` 一致：被采样网格包围盒对角线 × `1e-3`（等价 `tol2 = 对角线² × 1e-6`，内部用平方距离比较）；`SetTolerance(t)` 手动指定，`t` 是**相对**包围盒对角线的比例（注意 VTK 的 `SetTolerance` 是绝对长度），`t <= 0` 恢复自动；`GetEffectiveTolerance()` 返回本次实际使用的绝对容差。
 - **单元包含判定的参数域容差与 VTK 一致**：VTK `EvaluatePosition` 判定 `pcoords ∈ [-0.001, 1.001]`（`[0,1]` 参数），即允许 `1e-3` 的越界；`[-1,1]` 参数化的单元（20 / 27 节点六面体、双二次四边形等）等价容差为 `2e-3`。因此**贴单元边界的采样点与 VTK 得到相同的有效 / 无效判定**。
 - 超出容差范围 → 该采样点 `validpointmask = 0`、插值属性全 `0`；`GetValidPoints()` 给出有效采样点的 id 列表（等价 `vtkProbeFilter::GetValidPoints()`），`GetSampleCellIds()` 给出每个采样点命中的单元 id（`-1` = 无效）。
