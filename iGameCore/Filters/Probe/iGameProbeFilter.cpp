@@ -11,8 +11,6 @@
 // ============================================================================
 #include "iGameProbeFilter.h"
 
-#include "iGameProbeLocator.h"
-
 #include <iGameAttributeSet.h>
 #include <iGameCellArray.h>
 #include <iGameCompositeDataObject.h>
@@ -233,12 +231,144 @@ bool IsBlankedCell(ArrayObject* ghost, igIndex cellId) {
     return (static_cast<unsigned char>(v) & kGhostCellMask) != 0;
 }
 
+/**
+ * 未实现 VTK 插值的单元类型（部分高阶 / Lagrange 等）退化为「前 N 个角点」的线性单元时
+ * 需要的角点数。等价旧内核的 LinearCornerCount + 角点线性退化策略；返回 0 = 不退化。
+ */
+int LinearCornerCountForType(IGenum type, int npts) {
+    switch (type) {
+        case IG_QUADRATIC_EDGE:
+            return 2;
+        case IG_QUADRATIC_TRIANGLE:
+        case IG_BIQUADRATIC_TRIANGLE:
+        case IG_LAGRANGE_TRIANGLE:
+            return 3;
+        case IG_QUADRATIC_QUAD:
+        case IG_BIQUADRATIC_QUAD:
+        case IG_QUADRATIC_LINEAR_QUAD:
+        case IG_LAGRANGE_QUADRILATERAL:
+            return 4;
+        case IG_QUADRATIC_TETRA:
+        case IG_LAGRANGE_TETRAHEDRON:
+            return 4;
+        case IG_QUADRATIC_PRISM:
+        case IG_QUADRATIC_LINEAR_WEDGE:
+        case IG_BIQUADRATIC_QUADRATIC_WEDGE:
+        case IG_LAGRANGE_PRISM:
+            return 6;
+        case IG_QUADRATIC_PYRAMID:
+        case IG_TRIQUADRATIC_PYRAMID:
+        case IG_LAGRANGE_PYRAMID:
+            return 5;
+        case IG_QUADRATIC_HEXAHEDRON:
+        case IG_TRIQUADRATIC_HEXAHEDRON:
+        case IG_BIQUADRATIC_QUADRATIC_HEXAHEDRON:
+        case IG_LAGRANGE_HEXAHEDRON:
+            return 8;
+        case IG_QUADRATIC_POLYGON:
+            return (npts >= 4) ? 4 : 0; // 二次多边形：退化为前 4 个角点
+        default:
+            return 0;
+    }
+}
+
+/** 退化用的线性单元（每线程一份，避免与 mesh 内部共享缓存单元对象） */
+Cell* FallbackCellForType(IGenum type) {
+    thread_local struct {
+        Cell::Pointer line;
+        Cell::Pointer triangle;
+        Cell::Pointer quad;
+        Cell::Pointer tetra;
+        Cell::Pointer prism;
+        Cell::Pointer pyramid;
+        Cell::Pointer hexahedron;
+    } cache;
+
+    switch (type) {
+        case IG_QUADRATIC_EDGE:
+            if (cache.line == nullptr) { cache.line = Line::New(); }
+            return cache.line.get();
+        case IG_QUADRATIC_TRIANGLE:
+        case IG_BIQUADRATIC_TRIANGLE:
+        case IG_LAGRANGE_TRIANGLE:
+            if (cache.triangle == nullptr) { cache.triangle = Triangle::New(); }
+            return cache.triangle.get();
+        case IG_QUADRATIC_QUAD:
+        case IG_BIQUADRATIC_QUAD:
+        case IG_QUADRATIC_LINEAR_QUAD:
+        case IG_QUADRATIC_POLYGON:
+        case IG_LAGRANGE_QUADRILATERAL:
+            if (cache.quad == nullptr) { cache.quad = Quad::New(); }
+            return cache.quad.get();
+        case IG_QUADRATIC_TETRA:
+        case IG_LAGRANGE_TETRAHEDRON:
+            if (cache.tetra == nullptr) { cache.tetra = Tetra::New(); }
+            return cache.tetra.get();
+        case IG_QUADRATIC_PRISM:
+        case IG_QUADRATIC_LINEAR_WEDGE:
+        case IG_BIQUADRATIC_QUADRATIC_WEDGE:
+        case IG_LAGRANGE_PRISM:
+            if (cache.prism == nullptr) { cache.prism = Prism::New(); }
+            return cache.prism.get();
+        case IG_QUADRATIC_PYRAMID:
+        case IG_TRIQUADRATIC_PYRAMID:
+        case IG_LAGRANGE_PYRAMID:
+            if (cache.pyramid == nullptr) { cache.pyramid = Pyramid::New(); }
+            return cache.pyramid.get();
+        case IG_QUADRATIC_HEXAHEDRON:
+        case IG_TRIQUADRATIC_HEXAHEDRON:
+        case IG_BIQUADRATIC_QUADRATIC_HEXAHEDRON:
+        case IG_LAGRANGE_HEXAHEDRON:
+            if (cache.hexahedron == nullptr) { cache.hexahedron = Hexahedron::New(); }
+            return cache.hexahedron.get();
+        default:
+            return nullptr;
+    }
+}
+
+/**
+ * 取用于求值的单元对象：优先用单元类型自己的 VTK 插值实现；若该类型在 GetTypedCell 里
+ * 没有对应单元类（拿到 EmptyCell），退化为「前 N 个角点」的线性单元（等价旧内核的角点
+ * 线性退化，并在 SampleLocation::degraded 标记）。nptsOut 返回实际参与求值的点数。
+ *
+ * 注意：插值阶段（InterpolateAttributes）必须用同一个函数再取一次单元，才能保证
+ * 权重与全局点 id 一一对应。
+ */
+Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& nptsOut, bool* degraded) {
+    if (degraded != nullptr) { *degraded = false; }
+    igIndex ptIds[IGAME_CELL_MAX_SIZE];
+    const int npts = mesh->GetCellPointIds(cellId, ptIds);
+    nptsOut = npts;
+    if (npts <= 0) { return nullptr; }
+
+    Cell* cell = mesh->GetCell(cellId);
+    if (cell != nullptr && cell->GetCellType() != IG_EMPTY_CELL) { return cell; }
+
+    const IGenum type = mesh->GetCellType(cellId);
+    const int corners = LinearCornerCountForType(type, npts);
+    if (corners <= 0 || corners > npts) { return cell; }
+
+    Cell* fallback = FallbackCellForType(type);
+    if (fallback == nullptr) { return cell; }
+
+    fallback->Reset();
+    for (int i = 0; i < corners; ++i) {
+        const Point& p = mesh->GetPoint(ptIds[i]);
+        fallback->m_Points->AddPoint(p[0], p[1], p[2]);
+        fallback->m_PointIds->AddId(ptIds[i]);
+    }
+    nptsOut = corners;
+    if (degraded != nullptr) { *degraded = true; }
+    return fallback;
+}
+
 /** 用单元类型自己的 EvaluatePosition 求采样点位置（VTK 的 vtkCell::EvaluatePosition） */
 int EvaluateCellAt(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p,
                    ProbeFilter::SampleLocation& loc) {
-    Cell* cell = mesh->GetCell(cellId);
+    int n = 0;
+    bool degraded = false;
+    Cell* cell = KernelCellFor(mesh, cellId, n, &degraded);
     if (cell == nullptr) { return 0; }
-    const int n = cell->GetCellSize();
     if (n <= 0 || n > IGAME_CELL_MAX_SIZE) { return 0; }
 
     double pcoords[3] = {0.0, 0.0, 0.0};
@@ -256,6 +386,7 @@ int EvaluateCellAt(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const 
     loc.pcoords[2] = pcoords[2];
     loc.dist2 = dist2;
     loc.numWeights = n;
+    loc.degraded = degraded;
     return (rc == 1) ? 1 : 0;
 }
 
@@ -910,8 +1041,9 @@ void ProbeFilter::InterpolateAttributes(const UnstructuredMesh::Pointer& mesh,
         std::vector<double> raw;
         for (int j = 0; j < sampleNum; ++j) {
             const SampleLocation& loc = locations[static_cast<size_t>(j)];
-            Cell* cell = (loc.cellId >= 0) ? mesh->GetCell(loc.cellId) : nullptr;
-            const int npts = (cell != nullptr) ? cell->GetCellSize() : 0;
+            // 与定位阶段用同一个 KernelCellFor：退化单元（EmptyCell → 角点线性）也能拿到正确的全局点 id
+            int npts = 0;
+            Cell* cell = (loc.cellId >= 0) ? KernelCellFor(mesh, loc.cellId, npts, nullptr) : nullptr;
             const bool valid = (cell != nullptr) && (npts > 0) && (loc.numWeights == npts);
 
             for (auto& out : outs) {

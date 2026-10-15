@@ -11,7 +11,8 @@
 //   auto f = ProbeFilter::New();
 //   f->SetInput(model);        // 模型网格
 //   f->SetInput(1, queryPts);  // 查询点点集（Execute 后原地带上插值属性）
-//   f->SetTolerance(1e-6);     // 可选；默认自动使用 kProbeDefaultTolerance
+//   f->SetTolerance(0.001);   // 可选：**绝对**距离容差；不设时用 VTK 默认
+//                             //（源包围盒对角线 × 1e-3，内部平方比较）
 //   f->Execute();
 //   auto result = f->GetOutput();  // 与 queryPts 为同一对象
 //
@@ -79,6 +80,7 @@ public:
         int numWeights{0};                      // 形函数权重个数（= 单元点数）
         double weights[IGAME_CELL_MAX_SIZE]{};  // pcoords 处的形函数值
         bool snapped{false};                    // 是否靠“吸附到最近单元”才命中（VTK SnapToCellWithClosestPoint）
+        bool degraded{false};                   // 是否走“角点线性退化”（该单元类型尚未实现 VTK 插值）
     };
 
     /** 采样选项（与 vtkProbeFilter 的属性逐项对应） */

@@ -347,6 +347,8 @@ bool ResampleWithDataSet::Execute() {
         m_SampleValidMask[si] = validMask[si];
         if (validMask[si] != 0) { ++validCount; }
         if (kernelLocations[si].snapped) { ++m_SnappedPointCount; }
+        // 角点线性退化：该单元类型尚未实现 VTK 插值（如部分高阶 / Lagrange）
+        if (kernelLocations[si].degraded) { ++m_UnsupportedQuadraticCellCount; }
     }
 
     // 属性：① 被采样网格的点数据插值 ② 其单元数据按命中单元拷到输出点 ③ validpointmask
@@ -379,7 +381,7 @@ bool ResampleWithDataSet::Execute() {
                      " (radius=" + std::to_string(m_EffectiveSnappingRadius) + ")";
     }
     if (m_UnsupportedQuadraticCellCount > 0) {
-        m_Message += ", degraded high-order cells=" + std::to_string(m_UnsupportedQuadraticCellCount);
+        m_Message += ", degraded cells=" + std::to_string(m_UnsupportedQuadraticCellCount);
     }
     return true;
 }
