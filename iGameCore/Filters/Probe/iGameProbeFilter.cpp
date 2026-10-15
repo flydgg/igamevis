@@ -19,6 +19,7 @@
 #include <iGameLagrangeHexahedron.h>
 #include <iGameLagrangeLine.h>
 #include <iGameLagrangeQuadrilateral.h>
+#include <iGameLagrangeTetrahedron.h>
 #include <iGameLagrangeTriangle.h>
 #include <iGameLagrangeUnstructuredMesh.h>
 #include <iGameStructuredMesh.h>
@@ -294,6 +295,7 @@ Cell* NativeCellForType(IGenum type) {
         Cell::Pointer quadraticLine, quadraticTriangle, quadraticQuad, quadraticTetra,
                 quadraticHexahedron, quadraticPrism, quadraticPyramid;
         Cell::Pointer lagrangeLine, lagrangeTriangle, lagrangeQuadrilateral, lagrangeHexahedron;
+        Cell::Pointer lagrangeTetrahedron;
     } cache;
 
     switch (type) {
@@ -362,6 +364,11 @@ Cell* NativeCellForType(IGenum type) {
                 cache.lagrangeHexahedron = LagrangeHexahedron::New();
             }
             return cache.lagrangeHexahedron.get();
+        case IG_LAGRANGE_TETRAHEDRON:
+            if (cache.lagrangeTetrahedron == nullptr) {
+                cache.lagrangeTetrahedron = LagrangeTetrahedron::New();
+            }
+            return cache.lagrangeTetrahedron.get();
         default:
             return nullptr;
     }

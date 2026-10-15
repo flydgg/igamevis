@@ -2,6 +2,7 @@
 #define iGameLagrangeTetrahedron_h
 
 #include "iGameLagrangeVolume.h"
+#include "iGameLagrangeTriangle.h"
 #include "iGameLagrangeQuadrilateral.h"
 #include "iGameLagrangeLine.h"
 
@@ -57,6 +58,75 @@ public:
         }
         return face;
     }
+    /* ---------------- VTK 风格插值接口（对照 vtkLagrangeTetra / vtkHigherOrderTetra） ------------ */
+    int GetParametricDimension() const noexcept override { return 3; }
+
+    // 等价 vtkHigherOrderTetra::GetParametricCenter：重心坐标各 1/4
+    void GetParametricCenter(double pcoords[3]) const override {
+        pcoords[0] = 0.25;
+        pcoords[1] = 0.25;
+        pcoords[2] = 0.25;
+    }
+
+    int GetCellSize() const noexcept override {
+        const int n = static_cast<int>(this->m_Points->GetNumberOfPoints());
+        if (n > 0) { return n; }
+        return (m_Order > 0) ? ((m_Order + 1) * (m_Order + 2) * (m_Order + 3) / 6) : 0;
+    }
+
+    int EffectiveOrder() const {
+        const int order = TetraOrderFromPointCount(this->GetCellSize());
+        return (order > 0) ? order : m_Order;
+    }
+
+    // 说明：VTK 的 InterpolateFunctions 对 n==2 且 15 点有专门分支，且其 10 点展开分支的
+    // 棱中点顺序与本仓库 GetEdgePointIds 的表**不一致**（VTK 自身的问题）；这里统一走
+    // 「Eta/Deta 直积 + 重心索引」的通用路径，与本仓库的边表（标准 vtkTetra 棱序）严格一致。
+    void InterpolationFunctions(const double pcoords[3], double* weights) const override {
+        const int order = this->EffectiveOrder();
+        const int n = this->GetCellSize();
+        if (order < 1 || weights == nullptr || n <= 0) { return; }
+        const double tau[4] = {pcoords[0], pcoords[1], pcoords[2],
+                               1.0 - pcoords[0] - pcoords[1] - pcoords[2]};
+        for (int idx = 0; idx < n; ++idx) {
+            int lambda[4] = {0, 0, 0, 0};
+            TetraBarycentricIndex(idx, lambda, order);
+            weights[idx] = SimplexEta(order, lambda[0], tau[0]) *
+                           SimplexEta(order, lambda[1], tau[1]) *
+                           SimplexEta(order, lambda[2], tau[2]) *
+                           SimplexEta(order, lambda[3], tau[3]);
+        }
+    }
+
+    void InterpolationDerivs(const double pcoords[3], double* derivs) const override {
+        const int order = this->EffectiveOrder();
+        const int n = this->GetCellSize();
+        if (order < 1 || derivs == nullptr || n <= 0) { return; }
+        const double tau[4] = {pcoords[0], pcoords[1], pcoords[2],
+                               1.0 - pcoords[0] - pcoords[1] - pcoords[2]};
+        for (int idx = 0; idx < n; ++idx) {
+            int lambda[4] = {0, 0, 0, 0};
+            TetraBarycentricIndex(idx, lambda, order);
+            const double e[4] = {SimplexEta(order, lambda[0], tau[0]),
+                                 SimplexEta(order, lambda[1], tau[1]),
+                                 SimplexEta(order, lambda[2], tau[2]),
+                                 SimplexEta(order, lambda[3], tau[3])};
+            const double d[4] = {SimplexDeta(order, lambda[0], tau[0]),
+                                 SimplexDeta(order, lambda[1], tau[1]),
+                                 SimplexDeta(order, lambda[2], tau[2]),
+                                 SimplexDeta(order, lambda[3], tau[3])};
+            const double common = e[0] * e[1] * e[2] * d[3];
+            derivs[idx] = d[0] * e[1] * e[2] * e[3] - common;             // ∂N/∂r
+            derivs[n + idx] = e[0] * d[1] * e[2] * e[3] - common;         // ∂N/∂s
+            derivs[2 * n + idx] = e[0] * e[1] * d[2] * e[3] - common;     // ∂N/∂t
+        }
+    }
+
+    int EvaluatePosition(const Point& x, Point& closestPoint, int& subId, double pcoords[3],
+                         double& dist2, double* weights) const override {
+        return this->EvaluatePositionNewton(x, closestPoint, subId, pcoords, dist2, weights);
+    }
+
     int GetEdgePointIds(const int edgeId, const igIndex*& ptIds) override {
         if (edgeId < 0 || edgeId >= 6) return 0;
         switch (m_Order) {

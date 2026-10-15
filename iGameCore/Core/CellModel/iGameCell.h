@@ -433,6 +433,61 @@ public:
 		}
 	}
 
+	/**
+	 * 四面体重心索引：等价 vtkHigherOrderTetra::BarycentricIndex（index → 四重指数），
+	 * 表取自 vtkHigherOrderTetra.cxx（EdgeVertices / LinearVertices / FaceBCoords /
+	 * FaceMinCoord / VertexMaxCoords 逐项一致）。
+	 */
+	static void TetraBarycentricIndex(int index, int* bindex, int order) {
+		static constexpr int kEdgeVertices[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
+		static constexpr int kLinearVertices[4][4] = {{0, 0, 0, 1}, {1, 0, 0, 0}, {0, 1, 0, 0},
+		                                              {0, 0, 1, 0}};
+		static constexpr int kFaceBCoords[4][3] = {{0, 2, 3}, {2, 0, 1}, {2, 1, 3}, {1, 0, 3}};
+		static constexpr int kFaceMinCoord[4] = {1, 3, 0, 2};
+		static constexpr int kVertexMaxCoords[4] = {3, 0, 1, 2};
+
+		int maxV = order;
+		int minV = 0;
+		int ord = order;
+		while (index >= 2 * (ord * ord + 1) && index != 0 && ord > 3) {
+			index -= 2 * (ord * ord + 1);
+			maxV -= 3;
+			++minV;
+			ord -= 4;
+		}
+
+		if (index < 4) {
+			for (int coord = 0; coord < 4; ++coord) {
+				bindex[coord] = (coord == kVertexMaxCoords[index]) ? maxV : minV;
+			}
+			return;
+		}
+		if (index - 4 < 6 * (ord - 1)) {
+			const int edgeId = (index - 4) / (ord - 1);
+			const int vertexId = (index - 4) % (ord - 1);
+			for (int coord = 0; coord < 4; ++coord) {
+				bindex[coord] = minV + (kLinearVertices[kEdgeVertices[edgeId][0]][coord] *
+				                                (maxV - minV - 1 - vertexId) +
+				                        kLinearVertices[kEdgeVertices[edgeId][1]][coord] * (1 + vertexId));
+			}
+			return;
+		}
+		const int faceId = (index - 4 - 6 * (ord - 1)) / ((ord - 2) * (ord - 1) / 2);
+		const int vertexId = (index - 4 - 6 * (ord - 1)) % ((ord - 2) * (ord - 1) / 2);
+		int projected[3] = {0, 0, 0};
+		if (ord != 3) { SimplexBarycentricIndex(vertexId, projected, ord - 3); }
+		for (int i = 0; i < 3; ++i) { bindex[kFaceBCoords[faceId][i]] = minV + 1 + projected[i]; }
+		bindex[kFaceMinCoord[faceId]] = minV;
+	}
+
+	/** 四面体：由点数反推阶数（n = (p+1)(p+2)(p+3)/6） */
+	static int TetraOrderFromPointCount(int n) {
+		for (int p = 1; p <= 10; ++p) {
+			if ((p + 1) * (p + 2) * (p + 3) / 6 == n) { return p; }
+		}
+		return -1;
+	}
+
 	/** 三角形：由点数反推阶数（n = (p+1)(p+2)/2） */
 	static int TriangleOrderFromPointCount(int n) {
 		for (int p = 1; p <= 12; ++p) {
