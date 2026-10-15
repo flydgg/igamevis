@@ -93,6 +93,11 @@ constexpr unsigned char kGhostHiddenCell = 32;
 constexpr unsigned char kGhostDuplicateCell = 64;
 constexpr unsigned char kGhostCellMask = static_cast<unsigned char>(kGhostHiddenCell | kGhostDuplicateCell);
 
+// 单元对象工厂（定义在后面；BuildCellGrid 需要用它判断是否能并行）
+IGenum LinearTypeFor(IGenum type);
+Cell* NativeCellForType(IGenum type);
+bool RequiresMeshCell(IGenum type);
+
 /** CSR 均匀网格：扁平候选表 + 每体素区间（避免 vector<vector<>> 的大量小分配） */
 struct CellGrid {
     igIndex nx{0}, ny{0}, nz{0};
@@ -173,8 +178,8 @@ void BuildCellGrid(const UnstructuredMesh::Pointer& mesh, const BoundingBox& bbo
     };
 
     for (igIndex cellId = 0; cellId < cellNum; ++cellId) {
-        // 需要面拓扑的单元（Polyhedron）只能用 mesh 的共享缓存单元对象 → 不适合并行
-        if (mesh->GetCellType(cellId) == IG_POLYHEDRON) { unsafeForParallel = true; }
+        // 只能用 mesh 共享缓存单元对象的类型（PolyLine / Polyhedron 等）不适合并行
+        if (RequiresMeshCell(mesh->GetCellType(cellId))) { unsafeForParallel = true; }
         double* box = &grid.boxes[static_cast<size_t>(cellId) * 6];
         ComputeCellBox(mesh, cellId, tol, box);
         igIndex* range = &ranges[static_cast<size_t>(cellId) * 6];
@@ -345,6 +350,17 @@ Cell* MakeCellForType(IGenum type) {
     if (Cell* native = NativeCellForType(type)) { return native; }
     const IGenum linear = LinearTypeFor(type);
     return (linear == IG_NONE) ? nullptr : NativeCellForType(linear);
+}
+
+/**
+ * 该类型是否必须用 mesh 内部构造的单元对象（共享缓存 → 不能并行）：
+ * 原生类型或可退化为角点线性的类型都用内核自己的每线程单元对象，其余（PolyLine / Polyhedron 等）
+ * 只能走 mesh->GetCell()。
+ */
+bool RequiresMeshCell(IGenum type) {
+    if (NativeCellForType(type) != nullptr) { return false; }
+    const IGenum linear = LinearTypeFor(type);
+    return !(linear != IG_NONE && NativeCellForType(linear) != nullptr);
 }
 
 /** 用网格单元的点填充内核自己的每线程单元对象（pointCount 个点） */
@@ -948,7 +964,8 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
         if (lastCellId >= 0 && lastCellId < cellNum && !IsBlankedCell(ghost, lastCellId)) {
             SampleLocation hint;
             const int rc = EvaluateCellAt(mesh, lastCellId, p, hint);
-            if (rc == 1) {
+            // 与 VTK 一致：0/1/2 维单元的「参数域内」不足以判定命中，距离还必须在容差内
+            if (rc == 1 && hint.dist2 <= tol2) {
                 loc = hint;
                 if (validMask != nullptr) { (*validMask)[i] = 1; }
                 return; // 提示命中
@@ -966,7 +983,7 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
                 if (IsBlankedCell(ghost, cellId)) { continue; }
                 SampleLocation cand;
                 const int rc = EvaluateCellAt(mesh, cellId, p, cand);
-                if (rc == 1) { best = cand; accepted = true; }
+                if (rc == 1 && cand.dist2 <= tol2) { best = cand; accepted = true; }
             }
         } else {
             const igIndex ix = std::max<igIndex>(0, std::min<igIndex>(
@@ -1026,13 +1043,16 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
                                 SampleLocation cand;
                                 const int rc = EvaluateCellAt(mesh, cellId, p, cand);
                                 if (rc < 0) { continue; }
-                                if (rc == 1) { // 在单元内：与 VTK 一致，直接命中
+                                // 在单元内**且**距离在容差内：与 VTK 一致，直接命中
+                                // （三维单元域内 dist2 == 0，退化为「是否在单元内」；0/1/2 维单元
+                                //   还要看点到单元的距离，等价 vtkProbeFilter 的 dist2 ≤ tol2 判定）
+                                if (rc == 1 && cand.dist2 <= tol2) {
                                     best = cand;
                                     foundCell = cellId;
                                     accepted = true;
                                     break;
                                 }
-                                // 不在单元内：记录最近点，最后按 dist2 ≤ tol2 决定（VTK FindCell 容差语义）
+                                // 其余（含「参数域内但超出容差」的 0/1/2 维单元）：按最近且 ≤ tol2 判定
                                 if (cand.dist2 <= tol2 && cand.dist2 < bestDist2) {
                                     bestDist2 = cand.dist2;
                                     best = cand;
