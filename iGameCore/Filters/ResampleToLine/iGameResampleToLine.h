@@ -109,6 +109,13 @@ public:
     }
     /** 手动容差；自动容差时返回 -1 */
     double GetTolerance() const { return m_AutoTolerance ? -1.0 : m_Tolerance; }
+
+    /**
+     * 只插值这些数组（按名字；点/单元数组共用一份名单）。
+     * 空名单 = 全部插值，保持 vtkProbeFilter 的默认语义。
+     */
+    void SetInterpolateArrays(std::vector<std::string> names) { m_InterpolateArrays = std::move(names); }
+    const std::vector<std::string>& GetInterpolateArrays() const { return m_InterpolateArrays; }
     /** 上一次 Execute() 实际使用的容差（绝对长度） */
     double GetEffectiveTolerance() const { return m_EffectiveTolerance; }
 
@@ -159,6 +166,7 @@ private:
     // 容差：默认自动（包围盒对角线 × kAutoToleranceRatio）
     bool m_AutoTolerance{true};
     double m_Tolerance{-1.0};
+    std::vector<std::string> m_InterpolateArrays{}; // 空 = 全部插值
     double m_EffectiveTolerance{0.0};
 
     std::string m_Message{"Not Executed !"};

@@ -110,6 +110,14 @@ public:
         m_ValidPointMaskArrayName = maskName.empty() ? std::string("validpointmask") : maskName;
     }
     const std::string& GetValidPointMaskArrayName() const { return m_ValidPointMaskArrayName; }
+
+    /**
+     * 只插值这些数组（按名字；点/单元数组共用一份名单）。
+     * 空名单 = 全部插值，保持 vtkProbeFilter 的默认语义。
+     * 真实结果常带几十条数组，全插一遍通常是最大的单项开销；界面只显示某几条时传进来即可。
+     */
+    void SetInterpolateArrays(std::vector<std::string> names) { m_InterpolateArrays = std::move(names); }
+    const std::vector<std::string>& GetInterpolateArrays() const { return m_InterpolateArrays; }
     void SetSnappingRadius(double r = 0) { m_SnappingRadius = (r > 0.0) ? r : -1.0; }
     double GetSnappingRadius() const { return m_SnappingRadius; }
     /** 上一次 Execute() 实际使用的吸附半径（绝对长度）；< 0 表示未启用 */
@@ -148,6 +156,7 @@ private:
 
     // 吸附半径：默认关闭（相对包围盒对角线长度，<= 0 表示关闭）
     std::string m_ValidPointMaskArrayName{"validpointmask"};
+    std::vector<std::string> m_InterpolateArrays{}; // 空 = 全部插值
     double m_SnappingRadius{-1.0};
     double m_EffectiveSnappingRadius{-1.0};
 

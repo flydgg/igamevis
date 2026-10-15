@@ -132,6 +132,10 @@ public:
         bool interpolatePointData{true}; // 源点数据插值到采样点
         bool copyCellData{true};         // 源单元数据按命中单元拷到输出点数据（VTK InputCellArrays）
         bool skipBlankedCells{true};     // 跳过 vtkGhostType 中 HIDDENCELL/DUPLICATECELL 的单元
+        // 只插值这些数组（按名字匹配；空 = 全部，保持 VTK vtkProbeFilter 的默认语义）。
+        // 真实 CFD 结果常带几十条数组，全插一遍往往是最大的单项开销；
+        // 只要显示某几条时把名字传进来即可（点/单元数组共用这一份名单）。
+        std::vector<std::string> interpolateArrays;
         bool snapToCellWithClosestPoint{false}; // 未命中时吸附到最近单元的最近点（VTK 默认关）
         double snappingRadius{-1.0};     // 吸附半径（绝对长度）；<0 = 不限（VTK 默认正无穷）
         std::string maskArrayName{"validpointmask"}; // 掩膜数组名；空串 = 不输出掩膜

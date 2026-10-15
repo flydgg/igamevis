@@ -119,6 +119,7 @@ bool ResampleToLine::Execute() {
     //      VTK 插值；二次单元直接由 QuadraticXxx::EvaluatePosition 求值，未实现插值的类型
     //      退化为角点线性。沿线采样不做吸附。）
     ProbeFilter::ProbeOptions options;
+    options.interpolateArrays = m_InterpolateArrays; // 空 = 全部插值
     options.tolerance = m_EffectiveTolerance;             // 绝对长度
     options.maskArrayName = m_ValidPointMaskArrayName;    // 默认 validpointmask
     options.snapToCellWithClosestPoint = false;

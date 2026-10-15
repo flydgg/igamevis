@@ -1412,6 +1412,15 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
     return true;
 }
 
+/** 该数组名是否在「只插值这些数组」名单里（名单为空 = 全部插值） */
+inline bool ArrayRequested(const std::vector<std::string>& requested, const std::string& name) {
+    if (requested.empty()) { return true; }
+    for (const auto& n : requested) {
+        if (n == name) { return true; }
+    }
+    return false;
+}
+
 void ProbeFilter::InterpolateAttributes(const UnstructuredMesh::Pointer& mesh,
                                         AttributeSet::Pointer outSet,
                                         const std::vector<SampleLocation>& locations,
@@ -1438,6 +1447,7 @@ void ProbeFilter::InterpolateAttributes(const UnstructuredMesh::Pointer& mesh,
             auto& attr = all->GetElement(i);
             if (attr.isDeleted || attr.pointer == nullptr) { continue; }
             if (attr.attachmentType != IG_POINT) { continue; }
+            if (!ArrayRequested(options.interpolateArrays, attr.pointer->GetName())) { continue; }
             const int dim = attr.pointer->GetDimension();
             if (dim <= 0) { continue; }
 
@@ -1512,6 +1522,7 @@ void ProbeFilter::InterpolateAttributes(const UnstructuredMesh::Pointer& mesh,
             auto& attr = all->GetElement(i);
             if (attr.isDeleted || attr.pointer == nullptr) { continue; }
             if (attr.attachmentType != IG_CELL) { continue; }
+            if (!ArrayRequested(options.interpolateArrays, attr.pointer->GetName())) { continue; }
 
             auto src = attr.pointer;
             const std::string name = src->GetName();

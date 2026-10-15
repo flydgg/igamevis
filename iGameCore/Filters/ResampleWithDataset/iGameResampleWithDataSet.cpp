@@ -353,6 +353,7 @@ bool ResampleWithDataSet::Execute() {
     options.maskArrayName = m_ValidPointMaskArrayName;        // 掩膜名可配置（默认 validpointmask）
     options.snapToCellWithClosestPoint = snappingEnabled;     // VTK SnapToCellWithClosestPoint
     options.snappingRadius = m_EffectiveSnappingRadius;       // <0 = 不限
+    options.interpolateArrays = m_InterpolateArrays;          // 空 = 全部插值（VTK 默认）
 
     std::vector<ProbeFilter::SampleLocation> kernelLocations(static_cast<size_t>(sampleNum));
     std::vector<unsigned char> validMask(static_cast<size_t>(sampleNum), 0);
