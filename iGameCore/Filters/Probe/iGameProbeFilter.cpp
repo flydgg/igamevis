@@ -11,6 +11,9 @@
 // ============================================================================
 #include "iGameProbeFilter.h"
 
+#include <atomic>
+#include <cstdlib>
+
 #include <iGameThreadPool.h>
 #include <iGameAttributeSet.h>
 #include <iGamePolyLine.h>
@@ -94,6 +97,19 @@ constexpr igIndex kGridMinDim = 4;
 constexpr igIndex kGridMaxDim = 96;
 /** 目标“每体素单元数”，用于自动选择网格分辨率（vtkStaticCellLocator 的 NumberOfCellsPerNode 思路） */
 constexpr double kCellsPerVoxelTarget = 4.0;
+
+// 诊断计数（IGAME_PROBE_STATS=1 时开启，用于定位内核热点：每命中评估多少候选单元等）
+inline bool ProbeStatsEnabled() {
+    static const bool enabled = (std::getenv("IGAME_PROBE_STATS") != nullptr);
+    return enabled;
+}
+struct ProbeStats {
+    std::atomic<unsigned long long> candidates{0};   // EvaluateCellAt 调用次数
+    std::atomic<unsigned long long> hintEvals{0};    // lastCell 提示求值次数
+    std::atomic<unsigned long long> hits{0};         // 命中数
+    std::atomic<unsigned long long> samples{0};      // 采样点数
+};
+ProbeStats g_ProbeStats;
 
 /** vtkDataSetAttributes 的 ghost 位：HIDDENCELL / DUPLICATECELL */
 constexpr unsigned char kGhostHiddenCell = 32;
@@ -1207,6 +1223,7 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
                                       : tol;
 
     // 单点定位：结果与线程调度无关（lastCell 只是提示；命中判定与容差均与顺序无关）
+    const bool stats = ProbeStatsEnabled();
     const auto locateOne = [&](size_t i, LocateScratch& scratch) {
         const Point& p = positions[i];
         SampleLocation& loc = out[i];
@@ -1220,6 +1237,7 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
 
         // 把求值结果落到输出：只写 numWeights 个权重到权重池
         const auto accept = [&](const CellEval& e, const double* w, bool isSnapped) {
+            if (stats) { g_ProbeStats.hits.fetch_add(1, std::memory_order_relaxed); }
             loc.cellId = e.cellId;
             loc.subId = e.subId;
             loc.closestPoint = e.closestPoint;
@@ -1266,6 +1284,7 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
         }
         if (hintInBox && lastCellId >= 0 && lastCellId < cellNum && !IsBlankedCell(ghost, lastCellId)) {
             CellEval hint;
+            if (stats) { g_ProbeStats.hintEvals.fetch_add(1, std::memory_order_relaxed); }
             const int rc = EvaluateCellAt(mesh, lastCellId, p, hint, weightsScratch);
             // 与 VTK 一致：0/1/2 维单元的「参数域内」不足以判定命中，距离还必须在容差内
             if (rc == 1 && hint.dist2 <= tol2) {
@@ -1349,6 +1368,7 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
                                 if (IsBlankedCell(ghost, cellId)) { continue; }
 
                                 CellEval cand;
+                                if (stats) { g_ProbeStats.candidates.fetch_add(1, std::memory_order_relaxed); }
                                 const int rc = EvaluateCellAt(mesh, cellId, p, cand, weightsScratch);
                                 if (rc < 0) { continue; }
                                 // 在单元内**且**距离在容差内：与 VTK 一致，直接命中
@@ -1421,6 +1441,16 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
     } else {
         LocateScratch scratch;
         for (size_t i = begin; i < end; ++i) { locateOne(i, scratch); }
+    }
+    if (stats) {
+        g_ProbeStats.samples.fetch_add(static_cast<unsigned long long>(end - begin), std::memory_order_relaxed);
+        const unsigned long long samples = g_ProbeStats.samples.load();
+        const unsigned long long cand = g_ProbeStats.candidates.load();
+        const unsigned long long hit = g_ProbeStats.hits.load();
+        const unsigned long long hint = g_ProbeStats.hintEvals.load();
+        igDebug("[probe stats] 采样点={} 候选求值={}（{:.2f}/点） 命中={} 提示求值={}（{:.2f}/点）",
+                samples, cand, samples ? double(cand) / samples : 0.0, hit, hint,
+                samples ? double(hint) / samples : 0.0);
     }
     return true;
 }
