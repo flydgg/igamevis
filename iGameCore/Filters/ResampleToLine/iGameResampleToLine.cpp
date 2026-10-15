@@ -124,8 +124,9 @@ bool ResampleToLine::Execute() {
     options.snapToCellWithClosestPoint = false;
 
     std::vector<ProbeFilter::SampleLocation> kernelLocations;
+    ProbeFilter::SampleWeights kernelWeights = ProbeFilter::MakeSampleWeights(mesh, positions.size());
     std::vector<unsigned char> validMask;
-    if (!ProbeFilter::LocatePositions(mesh, positions, options, kernelLocations, &validMask)) {
+    if (!ProbeFilter::LocatePositions(mesh, positions, options, kernelLocations, &validMask, &kernelWeights)) {
         m_Message = "failed to locate sample points on the input mesh";
         return false;
     }
@@ -144,7 +145,7 @@ bool ResampleToLine::Execute() {
 
     // 4. 插值 Point Data / 复制 Cell Data / 有效点掩码（内核按 VTK 语义统一处理）
     AttributeSet::Pointer outAttr = AttributeSet::New();
-    ProbeFilter::InterpolateAttributes(mesh, outAttr, kernelLocations, options);
+    ProbeFilter::InterpolateAttributes(mesh, outAttr, kernelLocations, options, &kernelWeights);
 
     // 6. 生成折线输出
     BuildPolyLineOutputs(samples, outAttr, n);

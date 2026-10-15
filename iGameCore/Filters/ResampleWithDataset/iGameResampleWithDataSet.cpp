@@ -356,6 +356,9 @@ bool ResampleWithDataSet::Execute() {
 
     std::vector<ProbeFilter::SampleLocation> kernelLocations(static_cast<size_t>(sampleNum));
     std::vector<unsigned char> validMask(static_cast<size_t>(sampleNum), 0);
+    // 形函数权重池：stride = 源网格最大单元点数（六面体=8）。原来权重内嵌在
+    // SampleLocation 里（2 KB/点，百万采样点即 2 GB），现在按 numWeights 个 double 写入。
+    ProbeFilter::SampleWeights kernelWeights = ProbeFilter::MakeSampleWeights(mesh, static_cast<size_t>(sampleNum));
 
     // 分块调用内核对进度友好：每块内部仍然走并行（ParallelChunks），块之间上报一次进度。
     // 块数按采样点数自适应，样本少时只有 1 块，行为与单次调用完全一致。
@@ -364,7 +367,8 @@ bool ResampleWithDataSet::Execute() {
         const size_t begin = static_cast<size_t>(static_cast<long long>(sampleNum) * block / progressBlocks);
         const size_t end = static_cast<size_t>(static_cast<long long>(sampleNum) * (block + 1) / progressBlocks);
         // 范围式内核：结果直接写进预分配的总缓冲，不做逐元素回填（SampleLocation 约 2 KB/点）
-        if (!ProbeFilter::LocatePositionsRange(mesh, positions, begin, end, options, kernelLocations, &validMask)) {
+        if (!ProbeFilter::LocatePositionsRange(mesh, positions, begin, end, options, kernelLocations, &validMask,
+                                               &kernelWeights)) {
             m_Message = "「被采样网格」定位失败";
             return false;
         }
@@ -393,7 +397,7 @@ bool ResampleWithDataSet::Execute() {
     // 「采样点网格」自身的属性数组不复制到输出里（这两个开关针对的是探针输入，不是被采样网格）。
     AttributeSet::Pointer outAttr = AttributeSet::New();
     reportProgress(0.70, "重采样：插值属性…");
-    ProbeFilter::InterpolateAttributes(mesh, outAttr, kernelLocations, options);
+    ProbeFilter::InterpolateAttributes(mesh, outAttr, kernelLocations, options, &kernelWeights);
     reportProgress(0.95, "重采样：组装输出…");
 
     // 输出 = 采样点网格的同类型深拷贝（几何/拓扑独立），属性换成采样结果

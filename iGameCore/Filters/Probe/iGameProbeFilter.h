@@ -98,10 +98,33 @@ public:
         double pcoords[3]{0.0, 0.0, 0.0};       // 参数坐标（可超出 [0,1]）
         double dist2{0.0};                      // 到最近点的平方距离
         int numWeights{0};                      // 形函数权重个数（= 单元点数）
-        double weights[IGAME_CELL_MAX_SIZE]{};  // pcoords 处的形函数值
         bool snapped{false};                    // 是否靠“吸附到最近单元”才命中（VTK SnapToCellWithClosestPoint）
         bool degraded{false};                   // 是否走“角点线性退化”（该单元类型尚未实现 VTK 插值）
     };
+
+    /**
+     * 形函数权重池：每个采样点占 stride 个槽（stride = 源网格的最大单元点数）。
+     * 原先权重内嵌在 SampleLocation 里（double[256] = 2 KB/点，100 万采样点即 2 GB）；
+     * 拆成扁平池后单点结果约 64 B，且权重只写 numWeights 个 double（六面体仅 64 B）。
+     * stride 由 MakeSampleWeights 按源网格算出；调用方复用它给定位与插值。
+     */
+    struct SampleWeights {
+        std::vector<double> values;  // 大小 = stride * 采样点数
+        int stride{0};               // 每个采样点的槽数
+
+        const double* At(size_t i) const {
+            return values.data() + static_cast<size_t>(i) * static_cast<size_t>(stride);
+        }
+        double* At(size_t i) {
+            return values.data() + static_cast<size_t>(i) * static_cast<size_t>(stride);
+        }
+    };
+
+    /** 源网格的最大单元点数（等长单元 O(1)，混合单元 O(单元数)）。用于给权重池定 stride。 */
+    static int MaxCellPointCount(const UnstructuredMesh::Pointer& mesh);
+
+    /** 按源网格分配权重池（stride = MaxCellPointCount，内容清零）。 */
+    static SampleWeights MakeSampleWeights(const UnstructuredMesh::Pointer& mesh, size_t sampleCount);
 
     /** 采样选项（与 vtkProbeFilter 的属性逐项对应） */
     struct ProbeOptions {
@@ -157,7 +180,8 @@ public:
                                 const std::vector<Point>& positions,
                                 const ProbeOptions& options,
                                 std::vector<SampleLocation>& out,
-                                std::vector<unsigned char>* validMask = nullptr);
+                                std::vector<unsigned char>* validMask = nullptr,
+                                SampleWeights* weights = nullptr);
 
     /**
      * 范围式批量定位：out/validMask 由调用方按 positions.size() 预分配（并已完成初始化），
@@ -170,7 +194,8 @@ public:
                                      size_t end,
                                      const ProbeOptions& options,
                                      std::vector<SampleLocation>& out,
-                                     std::vector<unsigned char>* validMask = nullptr);
+                                     std::vector<unsigned char>* validMask = nullptr,
+                                     SampleWeights* weights = nullptr);
 
     /**
      * 批量属性（把数组追加到 outSet，VTK 语义）：
@@ -181,7 +206,8 @@ public:
     static void InterpolateAttributes(const UnstructuredMesh::Pointer& mesh,
                                       AttributeSet::Pointer outSet,
                                       const std::vector<SampleLocation>& locations,
-                                      const ProbeOptions& options);
+                                      const ProbeOptions& options,
+                                      const SampleWeights* weights = nullptr);
 
 protected:
     ProbeFilter();

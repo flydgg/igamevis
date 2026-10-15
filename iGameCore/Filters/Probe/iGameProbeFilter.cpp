@@ -519,8 +519,23 @@ Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& 
     return remember(fallback, corners, true);
 }
 
-int EvaluateCellAt(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p,
-                   ProbeFilter::SampleLocation& loc) {
+/**
+ * 候选单元求值结果（**不含权重**）。
+ * 权重只写进调用方给的暂存缓冲：形函数权重按 numWeights 个 double 写入权重池，
+ * 不再像以前那样把 2 KB 的 SampleLocation 整体拷贝来拷贝去。
+ */
+struct CellEval {
+    igIndex cellId{-1};
+    int subId{0};
+    Point closestPoint{0.f, 0.f, 0.f};
+    double pcoords[3]{0.0, 0.0, 0.0};
+    double dist2{0.0};
+    int numWeights{0};
+    bool degraded{false};
+};
+
+int EvaluateCellAt(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, CellEval& e,
+                   double* weightsScratch) {
     int n = 0;
     bool degraded = false;
     Cell* cell = KernelCellFor(mesh, cellId, n, &degraded);
@@ -531,21 +546,39 @@ int EvaluateCellAt(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const 
     double dist2 = 0.0;
     Point closest;
     int subId = 0;
-    const int rc = cell->EvaluatePosition(p, closest, subId, pcoords, dist2, loc.weights);
+    const int rc = cell->EvaluatePosition(p, closest, subId, pcoords, dist2, weightsScratch);
     if (rc < 0) { return -1; } // 退化单元
 
-    loc.cellId = cellId;
-    loc.subId = subId;
-    loc.closestPoint = closest;
-    loc.pcoords[0] = pcoords[0];
-    loc.pcoords[1] = pcoords[1];
-    loc.pcoords[2] = pcoords[2];
-    loc.dist2 = dist2;
-    loc.numWeights = n;
-    loc.degraded = degraded;
+    e.cellId = cellId;
+    e.subId = subId;
+    e.closestPoint = closest;
+    e.pcoords[0] = pcoords[0];
+    e.pcoords[1] = pcoords[1];
+    e.pcoords[2] = pcoords[2];
+    e.dist2 = dist2;
+    e.numWeights = n;
+    e.degraded = degraded;
     return (rc == 1) ? 1 : 0;
 }
 
+
+/**
+ * 取第 i 个采样点的形函数权重：
+ *   - 正常路径直接用调用方的权重池（权重由定位阶段按 numWeights 个 double 写入）；
+ *   - 兼容路径：未提供权重池时，用保存的最近点重新对该单元求值（每点一次，仅旧调用方走到）。
+ * 返回 nullptr 表示该采样点没有可用权重。
+ */
+inline const double* SampleWeightsAt(const UnstructuredMesh::Pointer& mesh,
+                                     const std::vector<ProbeFilter::SampleLocation>& locations,
+                                     const ProbeFilter::SampleWeights* weights, size_t i,
+                                     double* fallbackScratch) {
+    const ProbeFilter::SampleLocation& loc = locations[i];
+    if (loc.cellId < 0 || loc.numWeights <= 0) { return nullptr; }
+    if (weights != nullptr && weights->stride > 0) { return weights->At(i); }
+    CellEval e;
+    if (EvaluateCellAt(mesh, loc.cellId, loc.closestPoint, e, fallbackScratch) < 0) { return nullptr; }
+    return fallbackScratch;
+}
 
 /** 结构化网格点索引：i 变化最快，其次 j，最后 k（与 iGameStructuredMesh 一致） */
 inline igIndex StructuredPointId(const igIndex n[3], igIndex i, igIndex j, igIndex k) {
@@ -997,14 +1030,39 @@ double ProbeFilter::DefaultTolerance(const UnstructuredMesh::Pointer& mesh) {
     return diag * kVTKToleranceFactor;
 }
 
+int ProbeFilter::MaxCellPointCount(const UnstructuredMesh::Pointer& mesh) {
+    if (mesh.IsNull()) { return 0; }
+    CellArray* cells = mesh->GetCells();
+    if (cells == nullptr) { return 0; }
+    const IGsize n = mesh->GetNumberOfCells();
+    if (n == 0) { return 0; }
+    if (!cells->IsUseOffSet()) { return static_cast<int>(cells->GetCellSize(0)); } // 等长单元：O(1)
+    int maxSize = 0;
+    for (IGsize i = 0; i < n; ++i) {
+        maxSize = std::max(maxSize, static_cast<int>(cells->GetCellSize(i)));
+    }
+    return maxSize;
+}
+
+ProbeFilter::SampleWeights ProbeFilter::MakeSampleWeights(const UnstructuredMesh::Pointer& mesh,
+                                                          size_t sampleCount) {
+    SampleWeights weights;
+    const int maxCellPoints = std::max(1, MaxCellPointCount(mesh));
+    weights.stride = maxCellPoints;
+    weights.values.assign(static_cast<size_t>(maxCellPoints) * sampleCount, 0.0);
+    return weights;
+}
+
 bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
                                  const std::vector<Point>& positions,
                                  const ProbeOptions& options,
                                  std::vector<SampleLocation>& out,
-                                 std::vector<unsigned char>* validMask) {
+                                 std::vector<unsigned char>* validMask,
+                                 SampleWeights* weights) {
     out.assign(positions.size(), SampleLocation{});
     if (validMask != nullptr) { validMask->assign(positions.size(), 0); }
-    return LocatePositionsRange(mesh, positions, 0, positions.size(), options, out, validMask);
+    if (weights != nullptr) { std::fill(weights->values.begin(), weights->values.end(), 0.0); }
+    return LocatePositionsRange(mesh, positions, 0, positions.size(), options, out, validMask, weights);
 }
 
 bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
@@ -1013,7 +1071,8 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
                                        size_t end,
                                        const ProbeOptions& options,
                                        std::vector<SampleLocation>& out,
-                                       std::vector<unsigned char>* validMask) {
+                                       std::vector<unsigned char>* validMask,
+                                       SampleWeights* weights) {
     if (mesh.IsNull() || mesh->GetNumberOfCells() == 0) { return false; }
     if (positions.empty()) { return true; }
     // 调用方负责预分配；越界/非法范围直接视为无事可做
@@ -1154,6 +1213,31 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
         igIndex& lastCellId = scratch.lastCellId;
         scratch.NextGeneration(); // 本点的去重集合从“新的一代”开始，O(1) 失效
 
+        // 候选求值的权重暂存 + 最终命中单元的权重暂存（都是每点复用的小缓冲，
+        // 只按 numWeights 个 double 拷贝，而不是整块 2 KB 的 SampleLocation）
+        double weightsScratch[IGAME_CELL_MAX_SIZE];
+        double bestWeights[IGAME_CELL_MAX_SIZE];
+
+        // 把求值结果落到输出：只写 numWeights 个权重到权重池
+        const auto accept = [&](const CellEval& e, const double* w, bool isSnapped) {
+            loc.cellId = e.cellId;
+            loc.subId = e.subId;
+            loc.closestPoint = e.closestPoint;
+            loc.pcoords[0] = e.pcoords[0];
+            loc.pcoords[1] = e.pcoords[1];
+            loc.pcoords[2] = e.pcoords[2];
+            loc.dist2 = e.dist2;
+            loc.numWeights = e.numWeights;
+            loc.snapped = isSnapped;
+            loc.degraded = e.degraded;
+            if (weights != nullptr && weights->stride > 0) {
+                const int n = std::min(e.numWeights, weights->stride);
+                if (n > 0) {
+                    std::memcpy(weights->At(i), w, sizeof(double) * static_cast<size_t>(n));
+                }
+            }
+        };
+
         // 源包围盒（含余量）预判：域外点直接判无效（吸附不限半径时不做预判）
         if (bboxMargin >= 0.0) {
             bool outside = false;
@@ -1168,28 +1252,33 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
 
         // 1) 上一个命中单元作为提示（VTK 的 FindCell(x, lastCellId)）
         if (lastCellId >= 0 && lastCellId < cellNum && !IsBlankedCell(ghost, lastCellId)) {
-            SampleLocation hint;
-            const int rc = EvaluateCellAt(mesh, lastCellId, p, hint);
+            CellEval hint;
+            const int rc = EvaluateCellAt(mesh, lastCellId, p, hint, weightsScratch);
             // 与 VTK 一致：0/1/2 维单元的「参数域内」不足以判定命中，距离还必须在容差内
             if (rc == 1 && hint.dist2 <= tol2) {
-                loc = hint;
+                accept(hint, weightsScratch, false);
                 if (validMask != nullptr) { (*validMask)[i] = 1; }
                 return; // 提示命中
             }
         }
 
         igIndex foundCell = -1;
-        SampleLocation best;
+        CellEval best;
         double bestDist2 = DBL_MAX;
         bool accepted = false;
+        bool bestSnapped = false;
 
         if (!gridPtr->Valid()) {
             // 退化网格：退化为全单元扫描（保证正确性）
             for (igIndex cellId = 0; cellId < cellNum && !accepted; ++cellId) {
                 if (IsBlankedCell(ghost, cellId)) { continue; }
-                SampleLocation cand;
-                const int rc = EvaluateCellAt(mesh, cellId, p, cand);
-                if (rc == 1 && cand.dist2 <= tol2) { best = cand; accepted = true; }
+                CellEval cand;
+                const int rc = EvaluateCellAt(mesh, cellId, p, cand, weightsScratch);
+                if (rc == 1 && cand.dist2 <= tol2) {
+                    std::memcpy(bestWeights, weightsScratch, sizeof(double) * static_cast<size_t>(cand.numWeights));
+                    best = cand;
+                    accepted = true;
+                }
             }
         } else {
             const igIndex ix = std::max<igIndex>(0, std::min<igIndex>(
@@ -1246,21 +1335,23 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
                                 if (!scratch.MarkVisited(cellId)) { continue; }
                                 if (IsBlankedCell(ghost, cellId)) { continue; }
 
-                                SampleLocation cand;
-                                const int rc = EvaluateCellAt(mesh, cellId, p, cand);
+                                CellEval cand;
+                                const int rc = EvaluateCellAt(mesh, cellId, p, cand, weightsScratch);
                                 if (rc < 0) { continue; }
                                 // 在单元内**且**距离在容差内：与 VTK 一致，直接命中
                                 // （三维单元域内 dist2 == 0，退化为「是否在单元内」；0/1/2 维单元
                                 //   还要看点到单元的距离，等价 vtkProbeFilter 的 dist2 ≤ tol2 判定）
                                 if (rc == 1 && cand.dist2 <= tol2) {
-                                    best = cand;
-                                    foundCell = cellId;
-                                    accepted = true;
-                                    break;
+                                    accept(cand, weightsScratch, false);
+                                    lastCellId = cellId; // 保留 lastCell 提示（与逐单元扫描等价）
+                                    if (validMask != nullptr) { (*validMask)[i] = 1; }
+                                    return;
                                 }
                                 // 其余（含「参数域内但超出容差」的 0/1/2 维单元）：按最近且 ≤ tol2 判定
                                 if (cand.dist2 <= tol2 && cand.dist2 < bestDist2) {
                                     bestDist2 = cand.dist2;
+                                    std::memcpy(bestWeights, weightsScratch,
+                                                sizeof(double) * static_cast<size_t>(cand.numWeights));
                                     best = cand;
                                     foundCell = cellId;
                                 }
@@ -1280,19 +1371,21 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
             // 吸附：把采样点吸附到最近单元的最近点，用最近点处的形函数取插值（VTK 的
             // FindClosestPointWithinRadius + 在最近点插值；本实现不移动采样点坐标）
             if (!accepted && snapping && snapCellId >= 0) {
-                SampleLocation snapped;
-                const int rc = EvaluateCellAt(mesh, snapCellId, snapClosest, snapped);
+                CellEval snapped;
+                const int rc = EvaluateCellAt(mesh, snapCellId, snapClosest, snapped, weightsScratch);
                 if (rc >= 0) {
-                    snapped.snapped = true;
                     snapped.dist2 = snapDist2; // 保留到原始采样点的距离，便于诊断
                     best = snapped;
+                    std::memcpy(bestWeights, weightsScratch,
+                                sizeof(double) * static_cast<size_t>(snapped.numWeights));
+                    bestSnapped = true;
                     foundCell = snapCellId;
                 }
             }
         }
 
         if (foundCell >= 0) {
-            loc = best;
+            accept(best, bestWeights, bestSnapped);
             lastCellId = foundCell;
             if (validMask != nullptr) { (*validMask)[i] = 1; }
         } else {
@@ -1322,7 +1415,8 @@ bool ProbeFilter::LocatePositionsRange(const UnstructuredMesh::Pointer& mesh,
 void ProbeFilter::InterpolateAttributes(const UnstructuredMesh::Pointer& mesh,
                                         AttributeSet::Pointer outSet,
                                         const std::vector<SampleLocation>& locations,
-                                        const ProbeOptions& options) {
+                                        const ProbeOptions& options,
+                                        const SampleWeights* weights) {
     if (mesh.IsNull() || outSet.IsNull()) { return; }
     AttributeSet* inAttrs = mesh->GetAttributeSet();
     if (inAttrs == nullptr) { return; }
@@ -1366,14 +1460,18 @@ void ProbeFilter::InterpolateAttributes(const UnstructuredMesh::Pointer& mesh,
             // 与定位阶段用同一个 KernelCellFor：退化单元（EmptyCell → 角点线性）也能拿到正确的全局点 id
             int npts = 0;
             Cell* cell = (loc.cellId >= 0) ? KernelCellFor(mesh, loc.cellId, npts, nullptr) : nullptr;
-            const bool valid = (cell != nullptr) && (npts > 0) && (loc.numWeights == npts);
+            double fallbackWeights[IGAME_CELL_MAX_SIZE];
+            const double* weightValues =
+                    SampleWeightsAt(mesh, locations, weights, static_cast<size_t>(j), fallbackWeights);
+            const bool valid = (cell != nullptr) && (npts > 0) && (loc.numWeights == npts) &&
+                               (weightValues != nullptr);
 
             for (auto& out : outs) {
                 values.assign(static_cast<size_t>(out.dimension), 0.0);
                 if (valid) {
                     raw.resize(static_cast<size_t>(out.dimension));
                     for (int v = 0; v < npts; ++v) {
-                        const double w = loc.weights[v];
+                        const double w = weightValues[v];
                         if (w == 0.0) { continue; }
                         out.src->GetElement(static_cast<IGsize>(cell->GetPointId(v)), raw.data());
                         for (int c = 0; c < out.dimension; ++c) {
@@ -1561,7 +1659,8 @@ bool ProbeFilter::Execute() {
 
     std::vector<SampleLocation> locations;
     std::vector<unsigned char> validMask;
-    if (!LocatePositions(mesh, positions, options, locations, &validMask)) { return false; }
+    SampleWeights weights = MakeSampleWeights(mesh, positions.size());
+    if (!LocatePositions(mesh, positions, options, locations, &validMask, &weights)) { return false; }
 
     // ================= 逐采样点写回（原地更新查询点集）=================
     double rawValues[IGAME_CELL_MAX_SIZE] = {};
@@ -1570,14 +1669,17 @@ bool ProbeFilter::Execute() {
         const SampleLocation& loc = locations[static_cast<size_t>(qi)];
         Cell* cell = (loc.cellId >= 0) ? mesh->GetCell(loc.cellId) : nullptr;
         const int npts = (cell != nullptr) ? cell->GetCellSize() : 0;
-        const bool found = (cell != nullptr) && (npts > 0) && (loc.numWeights == npts);
+        double fallbackWeights[IGAME_CELL_MAX_SIZE];
+        const double* weightValues =
+                SampleWeightsAt(mesh, locations, &weights, static_cast<size_t>(qi), fallbackWeights);
+        const bool found = (cell != nullptr) && (npts > 0) && (loc.numWeights == npts) && (weightValues != nullptr);
 
         if (found) {
             for (auto& out : outAttributes) {
                 const int dimension = out.dimension;
                 for (int c = 0; c < dimension; ++c) { interpolated[c] = 0.0; }
                 for (int v = 0; v < npts; ++v) {
-                    const double w = loc.weights[v];
+                    const double w = weightValues[v];
                     if (w == 0.0) { continue; }
                     out.inArray->GetElement(cell->GetPointId(v), rawValues);
                     for (int c = 0; c < dimension; ++c) {
