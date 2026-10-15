@@ -950,18 +950,114 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
             (options.snappingRadius > 0.0) ? (options.snappingRadius * options.snappingRadius) : -1.0;
     const BoundingBox& bbox = mesh->GetBoundingBox();
 
-    CellGrid grid;
+    // 空间索引缓存：同一份源网格 + 同一容差下只建一次（等价 VTK 把 locator 缓存在 dataset 上）。
+    // 校验用「对象地址 + MTime + 点数/单元数 + 容差 + 包围盒」；MTime 是全局单调计数器，
+    // 因此不会因为对象析构后地址被复用而误命中；缓存只保存地址与指纹，解引用始终用调用方传入的 mesh。
+    struct GridCache {
+        const void* meshKey{nullptr};
+        unsigned int meshMTime{0};
+        IGsize pointCount{0};
+        IGsize cellCount{0};
+        double tolerance{-1.0};
+        double boundsMin[3]{0.0, 0.0, 0.0};
+        double boundsMax[3]{0.0, 0.0, 0.0};
+        bool valid{false};
+        CellGrid data;
+        bool unsafeForParallel{false};
+    };
+    thread_local GridCache s_gridCache;
+
+    const IGsize meshPointCount = mesh->GetNumberOfPoints();
+    const IGsize meshCellCount = mesh->GetNumberOfCells();
+    const unsigned int meshMTime = mesh->GetMTime();
+    const void* meshKey = static_cast<const void*>(mesh.GetPointer());
+
+    GridCache& cache = s_gridCache;
+    bool cacheHit = cache.valid && cache.meshKey == meshKey && cache.meshMTime == meshMTime &&
+                    cache.pointCount == meshPointCount && cache.cellCount == meshCellCount &&
+                    cache.tolerance == tol;
+    if (cacheHit) {
+        for (int j = 0; j < 3 && cacheHit; ++j) {
+            cacheHit = cache.boundsMin[j] == static_cast<double>(bbox.min[j]) &&
+                       cache.boundsMax[j] == static_cast<double>(bbox.max[j]);
+        }
+    }
+    // 缓存内存上限：索引本身是 O(单元数)（每单元 6 个 double 的包围盒 + 桶内引用），
+    // 超出阈值时不进缓存（改用局部索引，调用结束即释放），避免长期占用内存。
+    constexpr IGsize kMaxCachedCells = 4000000; // 约 240 MB 量级
+    const bool cacheable = meshCellCount <= kMaxCachedCells;
+
+    CellGrid localGrid;
+    bool localUnsafeForParallel = false;
+    const CellGrid* gridPtr = nullptr;
     bool unsafeForParallel = false;
-    BuildCellGrid(mesh, bbox, tol, grid, unsafeForParallel);
+
+    if (cacheable && cacheHit) {
+        gridPtr = &cache.data;
+        unsafeForParallel = cache.unsafeForParallel;
+    } else if (cacheable) {
+        BuildCellGrid(mesh, bbox, tol, cache.data, cache.unsafeForParallel);
+        cache.meshKey = meshKey;
+        cache.meshMTime = meshMTime;
+        cache.pointCount = meshPointCount;
+        cache.cellCount = meshCellCount;
+        cache.tolerance = tol;
+        for (int j = 0; j < 3; ++j) {
+            cache.boundsMin[j] = static_cast<double>(bbox.min[j]);
+            cache.boundsMax[j] = static_cast<double>(bbox.max[j]);
+        }
+        cache.valid = true;
+        gridPtr = &cache.data;
+        unsafeForParallel = cache.unsafeForParallel;
+    } else {
+        BuildCellGrid(mesh, bbox, tol, localGrid, localUnsafeForParallel);
+        gridPtr = &localGrid;
+        unsafeForParallel = localUnsafeForParallel;
+    }
+    // 注意：热循环里必须用**普通指针**访问索引数据。若每次都直接访问 cache.data（thread_local），
+    // TLS 间接寻址会让定位明显变慢。
     ArrayObject* ghost = FindCellGhostArray(mesh->GetAttributeSet());
 
-    // 每个线程一份 scratch：去重戳（环形扩张时同一单元可能落在多个体素里，等价 VTK 定位器
-    // 内的候选去重）+ lastCell 提示（VTK 的 FindCell(x, lastCellId)）
+    // 每个线程一份 scratch：
+    //   · 候选去重集合：环形扩张时同一单元可能落在多个体素里（等价 VTK 定位器内的候选去重）。
+    //     改成**定容开放寻址哈希 + 代计数器**，内存 O(1)，不再是原先 O(单元数) 的 stamp 数组
+    //     （原先千万单元量级下每线程约 80 MB）。表满时允许重复求值——只影响性能，不影响结果。
+    //   · lastCell 提示（VTK 的 FindCell(x, lastCellId)）
     struct LocateScratch {
-        std::vector<igIndex> stamp;
-        igIndex stampId{0};
+        enum : int { kVisitedSlots = 1024 }; // 必须是 2 的幂
+        struct Entry {
+            igIndex cellId{-1};
+            unsigned long long generation{0};
+        };
+        Entry visited[kVisitedSlots];
+        unsigned long long generation{0};
         igIndex lastCellId{-1};
-        explicit LocateScratch(size_t cellNum) : stamp(cellNum, -1) {}
+
+        void NextGeneration() { ++generation; }
+
+        /**
+         * 返回 true 表示该单元本点尚未见过（应继续求值）；false 表示已见过（跳过）。
+         * 探测长度有上限：表很满时直接返回 true（允许重复求值），保证单次调用 O(1)，
+         * 结果不受影响（重复求值只是多算一次，命中判定与取最近的过程都是幂等的）。
+         *
+         * 调用方应**先做便宜的单元包围盒预判**再调用本函数，否则"域内但不在任何单元里"的点
+         * 会把整个网格的单元都塞进表里，导致探测退化（实测慢一个数量级）。
+         */
+        bool MarkVisited(igIndex cellId) {
+            constexpr int kMaxProbe = 16;
+            const size_t mask = static_cast<size_t>(kVisitedSlots) - 1;
+            size_t slot = (static_cast<size_t>(cellId) * 2654435761u) & mask;
+            for (int probe = 0; probe < kMaxProbe; ++probe) {
+                Entry& e = visited[(slot + static_cast<size_t>(probe)) & mask];
+                if (e.generation != generation) {
+                    e.generation = generation;
+                    e.cellId = cellId;
+                    return true;
+                }
+                if (e.cellId == cellId) { return false; }
+            }
+            return true; // 探测过长：允许重复
+        }
     };
 
     const igIndex cellNum = static_cast<igIndex>(mesh->GetNumberOfCells());
@@ -978,8 +1074,7 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
         const Point& p = positions[i];
         SampleLocation& loc = out[i];
         igIndex& lastCellId = scratch.lastCellId;
-        std::vector<igIndex>& stamp = scratch.stamp;
-        igIndex& stampId = scratch.stampId;
+        scratch.NextGeneration(); // 本点的去重集合从“新的一代”开始，O(1) 失效
 
         // 源包围盒（含余量）预判：域外点直接判无效（吸附不限半径时不做预判）
         if (bboxMargin >= 0.0) {
@@ -1010,7 +1105,7 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
         double bestDist2 = DBL_MAX;
         bool accepted = false;
 
-        if (!grid.Valid()) {
+        if (!gridPtr->Valid()) {
             // 退化网格：退化为全单元扫描（保证正确性）
             for (igIndex cellId = 0; cellId < cellNum && !accepted; ++cellId) {
                 if (IsBlankedCell(ghost, cellId)) { continue; }
@@ -1020,18 +1115,18 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
             }
         } else {
             const igIndex ix = std::max<igIndex>(0, std::min<igIndex>(
-                    grid.nx - 1, static_cast<igIndex>((static_cast<double>(p[0]) - grid.origin[0]) / grid.voxel[0])));
+                    gridPtr->nx - 1, static_cast<igIndex>((static_cast<double>(p[0]) - gridPtr->origin[0]) / gridPtr->voxel[0])));
             const igIndex iy = std::max<igIndex>(0, std::min<igIndex>(
-                    grid.ny - 1, static_cast<igIndex>((static_cast<double>(p[1]) - grid.origin[1]) / grid.voxel[1])));
+                    gridPtr->ny - 1, static_cast<igIndex>((static_cast<double>(p[1]) - gridPtr->origin[1]) / gridPtr->voxel[1])));
             const igIndex iz = std::max<igIndex>(0, std::min<igIndex>(
-                    grid.nz - 1, static_cast<igIndex>((static_cast<double>(p[2]) - grid.origin[2]) / grid.voxel[2])));
+                    gridPtr->nz - 1, static_cast<igIndex>((static_cast<double>(p[2]) - gridPtr->origin[2]) / gridPtr->voxel[2])));
 
-            const igIndex maxRing = std::max<igIndex>(grid.nx, std::max<igIndex>(grid.ny, grid.nz));
+            const igIndex maxRing = std::max<igIndex>(gridPtr->nx, std::max<igIndex>(gridPtr->ny, gridPtr->nz));
             // 吸附时只需要扫到吸附半径覆盖的环；否则扫满整个网格
             igIndex ringLimit = maxRing;
             if (snapping && options.snappingRadius > 0.0) {
-                const double minVoxel = std::max(1e-12, std::min(grid.voxel[0],
-                                                                 std::min(grid.voxel[1], grid.voxel[2])));
+                const double minVoxel = std::max(1e-12, std::min(gridPtr->voxel[0],
+                                                                 std::min(gridPtr->voxel[1], gridPtr->voxel[2])));
                 ringLimit = std::min<igIndex>(maxRing,
                                               static_cast<igIndex>(std::ceil(options.snappingRadius / minVoxel)) + 1);
             }
@@ -1044,25 +1139,23 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
                 // 目前最近距离已经小于本环可能的最小距离 → 后续环不可能更近，可提前结束
                 if (snapping && !accepted && snapDist2 < DBL_MAX) {
                     const double minRingDist = (r > 0) ? (static_cast<double>(r) - 1.0) *
-                                                         std::min(grid.voxel[0], std::min(grid.voxel[1], grid.voxel[2]))
+                                                         std::min(gridPtr->voxel[0], std::min(gridPtr->voxel[1], gridPtr->voxel[2]))
                                                        : 0.0;
                     if (minRingDist * minRingDist > snapDist2) { break; }
                 }
-                ++stampId;
                 for (igIndex dx = -r; dx <= r && !accepted; ++dx) {
                     for (igIndex dy = -r; dy <= r && !accepted; ++dy) {
                         for (igIndex dz = -r; dz <= r && !accepted; ++dz) {
                             if (std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz))) != r) { continue; }
                             const igIndex cx = ix + dx, cy = iy + dy, cz = iz + dz;
-                            if (cx < 0 || cx >= grid.nx || cy < 0 || cy >= grid.ny || cz < 0 || cz >= grid.nz) { continue; }
-                            const size_t v = grid.VoxelIndex(cx, cy, cz);
-                            for (igIndex k = grid.offsets[v]; k < grid.offsets[v + 1]; ++k) {
-                                const igIndex cellId = grid.cells[static_cast<size_t>(k)];
-                                if (cellId < 0 || stamp[static_cast<size_t>(cellId)] == stampId) { continue; }
-                                stamp[static_cast<size_t>(cellId)] = stampId;
+                            if (cx < 0 || cx >= gridPtr->nx || cy < 0 || cy >= gridPtr->ny || cz < 0 || cz >= gridPtr->nz) { continue; }
+                            const size_t v = gridPtr->VoxelIndex(cx, cy, cz);
+                            for (igIndex k = gridPtr->offsets[v]; k < gridPtr->offsets[v + 1]; ++k) {
+                                const igIndex cellId = gridPtr->cells[static_cast<size_t>(k)];
+                                if (cellId < 0) { continue; }
 
-                                // 单元包围盒预判（吸附要求最近点，故按吸附半径外扩判定）
-                                const double* box = &grid.boxes[static_cast<size_t>(cellId) * 6];
+                                // 1) 单元包围盒预判（最便宜，先做；吸附时按吸附半径外扩判定）
+                                const double* box = &gridPtr->boxes[static_cast<size_t>(cellId) * 6];
                                 const double pad = snapping ? std::max(0.0, (options.snappingRadius > 0.0 ?
                                                                               options.snappingRadius : tol))
                                                             : tol;
@@ -1071,6 +1164,8 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
                                     static_cast<double>(p[2]) < box[2] - pad || static_cast<double>(p[2]) > box[5] + pad) {
                                     continue;
                                 }
+                                // 2) 去重：只对通过包围盒预判（即可能真正求值）的单元去重
+                                if (!scratch.MarkVisited(cellId)) { continue; }
                                 if (IsBlankedCell(ghost, cellId)) { continue; }
 
                                 SampleLocation cand;
@@ -1135,14 +1230,14 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
         const int maxThreads = std::max(1, ThreadPool::GetDefaultThreadCount());
         ThreadPool::parallelFor(0, static_cast<int>(sampleCount), maxThreads,
                                 [&](int begin, int end, int id) {
-                                    LocateScratch scratch(static_cast<size_t>(cellNum));
+                                    LocateScratch scratch;
                                     (void) id;
                                     for (int k = begin; k < end; ++k) {
                                         locateOne(static_cast<size_t>(k), scratch);
                                     }
                                 });
     } else {
-        LocateScratch scratch(static_cast<size_t>(cellNum));
+        LocateScratch scratch;
         for (size_t i = 0; i < sampleCount; ++i) { locateOne(i, scratch); }
     }
     return true;
