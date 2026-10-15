@@ -10,8 +10,10 @@
 //   3. 输出 0 与输入 1 为同一个对象，重复执行不新建点集。
 // ============================================================================
 #include "iGameProbeFilter.h"
+#include "iGameThreadPool.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 
 #include <iGameThreadPool.h>
@@ -193,49 +195,109 @@ void BuildCellGrid(const UnstructuredMesh::Pointer& mesh, const BoundingBox& bbo
     }
 
     grid.boxes.assign(static_cast<size_t>(cellNum) * 6, 0.0);
-    std::vector<igIndex> counts(grid.VoxelCount() + 1, 0);
     std::vector<igIndex> ranges(static_cast<size_t>(cellNum) * 6, 0); // 每单元的体素范围
+    const size_t voxelCount = grid.VoxelCount();
+    const bool buildStats = ProbeStatsEnabled();
+    const auto bT0 = std::chrono::steady_clock::now();
+    auto bMs = [&bT0]() {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bT0).count();
+    };
 
     const auto clampIndex = [](igIndex v, igIndex hi) {
         return std::max<igIndex>(0, std::min<igIndex>(hi - 1, v));
     };
 
-    for (igIndex cellId = 0; cellId < cellNum; ++cellId) {
-        // 只能用 mesh 共享缓存单元对象的类型（PolyLine / Polyhedron 等）不适合并行
-        if (RequiresMeshCell(mesh->GetCellType(cellId))) { unsafeForParallel = true; }
-        double* box = &grid.boxes[static_cast<size_t>(cellId) * 6];
-        ComputeCellBox(mesh, cellId, tol, box);
-        igIndex* range = &ranges[static_cast<size_t>(cellId) * 6];
-        for (int j = 0; j < 3; ++j) {
-            const igIndex dimJ = dim[j];
-            range[j] = clampIndex(static_cast<igIndex>((box[j] - grid.origin[j]) / grid.voxel[j]), dimJ);
-            range[3 + j] = clampIndex(static_cast<igIndex>((box[3 + j] - grid.origin[j]) / grid.voxel[j]), dimJ);
-        }
-        for (igIndex iz = range[2]; iz <= range[5]; ++iz) {
-            for (igIndex iy = range[1]; iy <= range[4]; ++iy) {
-                for (igIndex ix = range[0]; ix <= range[3]; ++ix) {
-                    ++counts[grid.VoxelIndex(ix, iy, iz)];
-                }
+    // ---------- 阶段 1：单元包围盒 + 体素范围（并行；写各自下标，无共享写） ----------
+    std::atomic<bool> unsafeFlag{false};
+    ThreadPool::parallelFor(0, static_cast<int>(cellNum), [&](int begin, int end) {
+        for (int cellId = begin; cellId < end; ++cellId) {
+            // 只能用 mesh 共享缓存单元对象的类型（PolyLine / Polyhedron 等）不适合并行查询，
+            // 但这里只读点号/坐标，构建本身仍可并行；标记供查询阶段使用。
+            if (RequiresMeshCell(mesh->GetCellType(static_cast<igIndex>(cellId)))) {
+                unsafeFlag.store(true, std::memory_order_relaxed);
+            }
+            double* box = &grid.boxes[static_cast<size_t>(cellId) * 6];
+            ComputeCellBox(mesh, static_cast<igIndex>(cellId), tol, box);
+            igIndex* range = &ranges[static_cast<size_t>(cellId) * 6];
+            for (int j = 0; j < 3; ++j) {
+                const igIndex dimJ = dim[j];
+                range[j] = clampIndex(static_cast<igIndex>((box[j] - grid.origin[j]) / grid.voxel[j]), dimJ);
+                range[3 + j] =
+                        clampIndex(static_cast<igIndex>((box[3 + j] - grid.origin[j]) / grid.voxel[j]), dimJ);
             }
         }
-    }
+    });
+    unsafeForParallel = unsafeFlag.load(std::memory_order_relaxed);
 
-    grid.offsets.assign(grid.VoxelCount() + 1, 0);
-    for (size_t v = 0; v < grid.VoxelCount(); ++v) {
-        grid.offsets[v + 1] = grid.offsets[v] + counts[v];
-    }
-    grid.cells.assign(static_cast<size_t>(grid.offsets.back()), -1);
-    std::vector<igIndex> cursor(grid.offsets.begin(), grid.offsets.end() - 1);
-    for (igIndex cellId = 0; cellId < cellNum; ++cellId) {
-        const igIndex* range = &ranges[static_cast<size_t>(cellId) * 6];
-        for (igIndex iz = range[2]; iz <= range[5]; ++iz) {
-            for (igIndex iy = range[1]; iy <= range[4]; ++iy) {
-                for (igIndex ix = range[0]; ix <= range[3]; ++ix) {
-                    const size_t v = grid.VoxelIndex(ix, iy, iz);
-                    grid.cells[static_cast<size_t>(cursor[v]++)] = cellId;
+    if (buildStats) { igDebug("[probe build] 阶段1 单元包围盒+体素范围: {} ms（单元 {}）", bMs(), cellNum); }
+    const auto bT1 = std::chrono::steady_clock::now();
+    auto bMs1 = [&bT1]() {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bT1).count();
+    };
+
+    // ---------- 阶段 2：计入体素（每线程一份计数表，避免原子/竞争；内存 = 体素数 × 4B × 线程数） ----------
+    const int threadCount = std::max(1, ThreadPool::GetDefaultThreadCount());
+    std::vector<std::vector<igIndex>> threadCounts(static_cast<size_t>(threadCount));
+    for (auto& tc : threadCounts) { tc.assign(voxelCount + 1, 0); }
+    ThreadPool::parallelFor(0, static_cast<int>(cellNum), [&](int begin, int end) {
+        // 线程号由区间起点反推（parallelFor 的区间划分是确定的连续块）
+        const int threadIndex = std::min(threadCount - 1, (begin * threadCount) / std::max<int>(1, static_cast<int>(cellNum)));
+        igIndex* counts = threadCounts[static_cast<size_t>(threadIndex)].data();
+        for (int cellId = begin; cellId < end; ++cellId) {
+            const igIndex* range = &ranges[static_cast<size_t>(cellId) * 6];
+            for (igIndex iz = range[2]; iz <= range[5]; ++iz) {
+                for (igIndex iy = range[1]; iy <= range[4]; ++iy) {
+                    const size_t base = grid.VoxelIndex(range[0], iy, iz);
+                    for (igIndex ix = range[0]; ix <= range[3]; ++ix) { ++counts[base + static_cast<size_t>(ix - range[0])]; }
                 }
             }
         }
+    });
+
+    // 归并各线程计数 + 前缀和（体素数 25 万级，串行足够快）
+    std::vector<igIndex> counts(voxelCount + 1, 0);
+    for (int t = 0; t < threadCount; ++t) {
+        const igIndex* tc = threadCounts[static_cast<size_t>(t)].data();
+        for (size_t v = 0; v < voxelCount; ++v) { counts[v] += tc[v]; }
+    }
+    grid.offsets.assign(voxelCount + 1, 0);
+    for (size_t v = 0; v < voxelCount; ++v) { grid.offsets[v + 1] = grid.offsets[v] + counts[v]; }
+    grid.cells.assign(static_cast<size_t>(grid.offsets.back()), -1);
+
+    // ---------- 阶段 3：填充（每线程从各自区段游标开始，写互不相交的槽位） ----------
+    std::vector<std::vector<igIndex>> threadCursor(static_cast<size_t>(threadCount));
+    {
+        std::vector<igIndex> running(voxelCount, 0); // 前 t 个线程在本体素的累计条数
+        for (int t = 0; t < threadCount; ++t) {
+            auto& cursor = threadCursor[static_cast<size_t>(t)];
+            cursor.resize(voxelCount);
+            const igIndex* tc = threadCounts[static_cast<size_t>(t)].data();
+            for (size_t v = 0; v < voxelCount; ++v) {
+                cursor[v] = grid.offsets[v] + running[v];
+                running[v] += tc[v];
+            }
+        }
+    }
+    ThreadPool::parallelFor(0, static_cast<int>(cellNum), [&](int begin, int end) {
+        const int threadIndex = std::min(threadCount - 1, (begin * threadCount) / std::max<int>(1, static_cast<int>(cellNum)));
+        igIndex* cursor = threadCursor[static_cast<size_t>(threadIndex)].data();
+        for (int cellId = begin; cellId < end; ++cellId) {
+            const igIndex* range = &ranges[static_cast<size_t>(cellId) * 6];
+            for (igIndex iz = range[2]; iz <= range[5]; ++iz) {
+                for (igIndex iy = range[1]; iy <= range[4]; ++iy) {
+                    const size_t base = grid.VoxelIndex(range[0], iy, iz);
+                    for (igIndex ix = range[0]; ix <= range[3]; ++ix) {
+                        const size_t v = base + static_cast<size_t>(ix - range[0]);
+                        grid.cells[static_cast<size_t>(cursor[v]++)] = static_cast<igIndex>(cellId);
+                    }
+                }
+            }
+        }
+    });
+
+    if (buildStats) {
+        igDebug("[probe build] 阶段2 计入体素: {} ms；阶段3 前缀+填充: {} ms；体素 {} 万，候选表 {} 万，线程 {}",
+                bMs1(), bMs(), voxelCount / 10000, grid.cells.size() / 10000, threadCount);
     }
 }
 
