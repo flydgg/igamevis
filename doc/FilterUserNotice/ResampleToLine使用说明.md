@@ -37,18 +37,27 @@
 
 ## 容差与无效点
 
-- **自动容差**（默认）：被采样网格包围盒对角线 × `1e-6`；`SetTolerance(t)` 手动指定，`t` 是**相对**包围盒对角线的比例，`t <= 0` 恢复自动；`GetEffectiveTolerance()` 返回本次实际使用的绝对容差。
+- **自动容差**（默认），与 `vtkProbeFilter` 一致：被采样网格包围盒对角线 × `1e-3`（等价 `tol2 = 对角线² × 1e-6`，内部用平方距离比较）；`SetTolerance(t)` 手动指定，`t` 是**相对**包围盒对角线的比例（注意 VTK 的 `SetTolerance` 是绝对长度），`t <= 0` 恢复自动；`GetEffectiveTolerance()` 返回本次实际使用的绝对容差。
 - **单元包含判定的参数域容差与 VTK 一致**：VTK `EvaluatePosition` 判定 `pcoords ∈ [-0.001, 1.001]`（`[0,1]` 参数），即允许 `1e-3` 的越界；`[-1,1]` 参数化的单元（20 / 27 节点六面体、双二次四边形等）等价容差为 `2e-3`。因此**贴单元边界的采样点与 VTK 得到相同的有效 / 无效判定**。
 - 超出容差范围 → 该采样点 `validpointmask = 0`、插值属性全 `0`；`GetValidPoints()` 给出有效采样点的 id 列表（等价 `vtkProbeFilter::GetValidPoints()`），`GetSampleCellIds()` 给出每个采样点命中的单元 id（`-1` = 无效）。
 
 ## 单元插值内核
 
-1. 0D 顶点单元：采样点落在容差内即取该点数据；
-2. 1D 线 / 折线 / 二次边 / Lagrange 曲线：逐段投影取最近的一段做线性插值；
-3. 线性面单元（三角形 / 四边形 / 多边形）：重心坐标 / 双线性 / 扇形三角化；
-4. 体单元（四面体 / 六面体 / 三棱柱 / 金字塔 / 多面体）：**均值坐标（Mean Value Coordinates）**；四面体的均值坐标即重心坐标，用解析解；
-5. 二次 / 高次单元：二次形函数 + 参数坐标 Newton 反解，覆盖 10 类——6 节点三角形、8 节点四边形、10 节点四面体、20 节点六面体、15 节点三棱柱、13 节点金字塔、9 节点双二次四边形、6 节点二次-线性四边形、12 节点二次-线性楔形、27 节点三二次六面体；后四类的节点序与形函数按 VTK 源码硬编码（`vtkBiQuadraticQuad` / `vtkQuadraticLinearQuad` / `vtkQuadraticLinearWedge` / `vtkTriQuadraticHexahedron`）；
-6. 未覆盖的高次单元（18 节点双二次-二次楔形、24 节点双二次-二次六面体、19 节点三二次金字塔、含棱中点的 `QuadraticPolygon`、任意阶 `Lagrange*`）：退化为角点线性（面单元）/ 角点线性 + 均值坐标（体单元），数量由 `GetUnsupportedQuadraticCellCount()` 与 `GetMessage()` 提示。
+定位 / 权重 / 点数据插值 / 单元数据拷贝 / 有效点掩膜**全部由 `ProbeFilter` 采样内核完成**
+（`ProbeFilter::BuildSourceMesh` + `LocatePositions` + `InterpolateAttributes`）。本类不再自带任何
+几何判定或插值实现：源归一化（含结构化网格 / 点云 / Lagrange / 容器合并）、CSR 空间索引、
+容差判定、lastCell 提示、掩膜生成都是与 `ProbeFilter` / `ResampleWithDataSet` 共用的一份代码。
+
+单元插值由**各单元类型自己的 VTK 复刻实现**（`iGameCore/Core/CellModel`）提供，
+逐行对照 `vtkCell` 与各 `vtkXxx`：
+
+1. 线性：`Vertex` / `Line` / `Triangle` / `Quad` / `Polygon` / `Tetra` / `Hexahedron` / `Prism` /
+   `Pyramid` / `Polyhedron`（`EvaluatePosition` / `InterpolationFunctions` / `InterpolationDerivs`）；
+2. 二次：`QuadraticTriangle` / `QuadraticQuad` / `QuadraticTetra` / `QuadraticHexahedron` /
+   `QuadraticPrism`(15 节点, `vtkQuadraticWedge`) / `QuadraticPyramid`(13 节点)；
+3. 尚未实现插值的类型（18 节点双二次-二次楔形、24 节点双二次-二次六面体、19 节点三二次金字塔、
+   含棱中点的 `QuadraticPolygon`、任意阶 `Lagrange*`）：内核退化为**前 N 个角点**的线性单元，
+   数量由 `GetUnsupportedQuadraticCellCount()` 与 `GetMessage()`（`degraded cells=N`）提示。
 
 ## 主要接口
 
@@ -127,9 +136,9 @@ Examples/Filter/TestResampleToLine.cpp
 ## 与 ParaView / VTK 的差异
 
 1. 采样点与几何坐标是单精度（框架 `typedef Vector3f Point`），VTK 为双精度；大坐标或高精度场会有末位差异；
-2. 体单元使用均值坐标，VTK 使用等参形函数；线性场一致，非线性场在单元内部会有差异；
-3. 楔形 / 棱柱的接受域在参数立方体之外**额外要求 `r + s <= 1`**（VTK 只判参数立方体），因此楔形「斜角外」区域的采样点判定可能与 VTK 不同；
-4. 未覆盖的高次单元退化为角点线性处理，注意 `GetUnsupportedQuadraticCellCount()` 与消息提示；
+2. 体单元使用各单元类型的 VTK 等参形函数复刻（`vtkHexahedron` / `vtkTetra` / `vtkWedge` / `vtkPyramid` / `vtkPolyhedron`），与 VTK 一致；
+3. 楔形 / 棱柱按 `vtkWedge` 的参数域判定（`GetParametricCenter`、域判定与 VTK 一致）；
+4. 尚未实现插值的类型退化为角点线性处理，注意 `GetUnsupportedQuadraticCellCount()` 与消息提示；
 5. **不提供吸附半径**：超出容差即判无效（`vtkProbeFilter` 的 `SnappingRadius` 语义在 `ResampleWithDataSet` 中提供）；
 6. 多块输入会先合并为一个网格（等价 Merge Blocks），而 VTK 的 executive 会逐块展开并保留块结构；
 7. 没有 field 数据（框架 `AttributeSet` 只有 `IG_POINT` / `IG_CELL`），也没有 `vtkOriginalPointIds` / `vtkOriginalCellIds` 这类附加数组。

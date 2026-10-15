@@ -37,34 +37,29 @@ IGAME_NAMESPACE_BEGIN
  *      时逐块转换并合并为一个网格（等价 ParaView 先 Merge Blocks 再 Plot Over Line），
  *      采样点命中多个块时取序号靠前的块的数据。
  *
- * 单元插值方式：
- *   1) 0D 顶点单元：采样点落在容差内即取该点数据；
- *   2) 1D 线 / 折线 / 二次边 / Lagrange 曲线：逐段投影取最近的一段做线性插值；
- *   3) 线性面单元（三角形 / 四边形 / 多边形）：线性插值（重心坐标 / 双线性 / 扇形三角化）；
- *   4) 体单元（四面体 / 六面体 / 三棱柱 / 金字塔 / 多面体）：均值坐标（Mean Value
- *      Coordinates）插值；四面体的均值坐标即重心坐标，直接用解析解；
- *   5) 二次 / 高次单元：二次形函数 + 参数坐标 Newton 反解，覆盖 10 类：
- *      6 节点三角形 / 8 节点四边形 / 10 节点四面体 / 20 节点六面体 /
- *      15 节点三棱柱（楔形） / 13 节点金字塔 /
- *      9 节点双二次四边形 / 6 节点二次-线性四边形 / 12 节点二次-线性楔形 / 27 节点三二次六面体；
- *      其中后四类的节点序与形函数按 VTK 硬编码，与 vtkBiQuadraticQuad / vtkQuadraticLinearQuad /
- *      vtkQuadraticLinearWedge / vtkTriQuadraticHexahedron 源码逐行一致。
- * 仍未实现的类型（18 节点双二次-二次楔形、24 节点双二次-二次六面体、19 节点三二次金字塔、
- * 含棱中点的 QuadraticPolygon、Lagrange* 任意阶）退化处理：面单元按角点线性、一维单元按
- * 节点折线、体单元按「角点线性 + 均值坐标」，并在 GetMessage() 中给出 degraded high-order
- * cells 数量提示。
+ * 采样内核：定位 / 权重 / 点数据插值 / 单元数据拷贝 / 有效点掩膜**全部由 ProbeFilter 采样内核完成**
+ * （ProbeFilter::BuildSourceMesh + LocatePositions + InterpolateAttributes）。本类只负责沿线生成
+ * 采样点、把内核结果整理成本类的查询接口、以及折线输出的构造，不再自带几何判定或插值实现。
  *
- * 采样点不在任何单元内（超出容差）时不再吸附最近单元，而是标记为无效：
- * 新增点数据属性 validpointmask（UnsignedCharArray），1 = 该采样点可插值，0 = 无效；数组名可用
- * SetValidPointMaskArrayName() 修改：默认 "validpointmask"（与本工程 ResampleWithDataSet 一致），
- * 设为 "vtkValidPointMask" 即与 VTK 默认命名一致。
- * 无效采样点各插值属性填 0（与 VTK vtkProbeFilter 行为一致），有效点 id 可用 GetValidPoints() 取出。
+ * 单元插值由各单元类型自己的 VTK 复刻实现（Core/CellModel）：
+ *   Vertex / Line / Triangle / Quad / Polygon / Tetra / Hexahedron / Prism / Pyramid / Polyhedron，
+ *   以及 QuadraticTriangle / QuadraticQuad / QuadraticTetra / QuadraticHexahedron /
+ *   QuadraticPrism(15, vtkQuadraticWedge) / QuadraticPyramid(13)——各自的 EvaluatePosition /
+ *   InterpolationFunctions / InterpolationDerivs 均逐行对照 vtkXxx。二次单元直接由
+ *   QuadraticXxx::EvaluatePosition 求值，内核不再重写形函数。
  *
- * 单元包含判定的参数域容差与 VTK 一致：VTK EvaluatePosition 允许 pcoords ∈ [-0.001, 1.001]
- * （[0,1] 参数），因此贴单元边界的采样点与 VTK 得到相同的有效 / 无效判定。
- * 插值结果保留源数组的数据类型与分量数（整型 / 字符型数组同样按原类型承载并截断）。
+ * 尚未实现插值的类型（18 节点双二次-二次楔形、24 节点双二次-二次六面体、19 节点三二次金字塔、
+ * 含棱中点的 QuadraticPolygon、Lagrange* 任意阶）由内核退化为「前 N 个角点」的线性单元，
+ * 数量见 GetUnsupportedQuadraticCellCount() 与 GetMessage() 中的 degraded cells=N。
  *
- * 容差默认自动计算（包围盒对角线 × 1e-6，紧容差），也可用 SetTolerance() 手动指定。
+ * 采样点不在任何单元内（超出容差）时标记为无效：输出点数据属性 validpointmask
+ * (UnsignedCharArray)，1 = 可插值，0 = 无效；数组名可用 SetValidPointMaskArrayName() 修改：
+ * 默认 "validpointmask"（与本工程 ResampleWithDataSet 一致），设为 "vtkValidPointMask" 即与
+ * VTK 默认命名一致。无效采样点各插值属性填 0（与 vtkProbeFilter 一致），有效点 id 用
+ * GetValidPoints() 取出。
+ *
+ * 容差默认自动，与 vtkProbeFilter 一致：源包围盒对角线 × 1e-3（等价 tol2 = 对角线² × 1e-6，
+ * 比较用平方距离）；也可用 SetTolerance() 手动指定（**相对**包围盒对角线的比例）。
  *
  * 输出：
  *   output 0 : UnstructuredMesh 折线（IG_LINE 单元），与既有流程兼容;
@@ -99,7 +94,8 @@ public:
 
     /**
      * 手动指定容差（相对于模型包围盒对角线长度）。
-     * t <= 0 时恢复自动容差（包围盒对角线 × 1e-6）。
+     * t <= 0 时恢复自动容差，对齐 vtkProbeFilter 的默认值（包围盒对角线 × 1e-3，
+     * 即 VTK 的 tol2 = 对角线² × 1e-6）。
      */
     void SetTolerance(double t) {
         if (t > 0.0) {
@@ -142,45 +138,9 @@ public:
     int GetLastInputBlockCount() const { return m_LastInputBlockCount; }
 
 private:
-    /** 单个采样点的定位与插值权重 */
-    struct SampleLocation {
-        igIndex cellId{-1};            // 命中的单元 id，-1 = 无效
-        Point point{0.f, 0.f, 0.f};    // 采样点
-        std::vector<igIndex> pointIds; // 命中单元的点 id（与权重一一对应）
-        std::vector<double> weights;   // 插值权重
-    };
-
-    /* ---------------- 几何搜索 ---------------- */
-    std::vector<std::vector<igIndex>> BuildUniformGrid(const UnstructuredMesh::Pointer& mesh,
-                                                       const BoundingBox& bbox, igIndex nx, igIndex ny, igIndex nz);
-    bool LocateSample(const UnstructuredMesh::Pointer& mesh, const Point& p, const BoundingBox& bbox,
-                      const std::vector<std::vector<igIndex>>& grid, igIndex nx, igIndex ny, igIndex nz,
-                      double distTol, SampleLocation& out);
-
-    /* ---------------- 单元权重 ---------------- */
-    bool ComputeCellWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol,
-                            std::vector<double>& weights);
-    bool ComputeLinearFaceWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol,
-                                  std::vector<double>& weights);
-    /** 0D 顶点单元 / 1D 线、折线、二次边、Lagrange 曲线单元：点包含判定与线性权重 */
-    bool ComputeLineWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol,
-                            std::vector<double>& weights);
-    bool ComputeMeanValueWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol,
-                                 std::vector<double>& weights);
-    bool ComputeQuadraticWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol,
-                                 std::vector<double>& weights);
-    /** 高次体单元退化：用线性角点单元的面表做均值坐标插值 */
-    bool ComputeDegradedVolumeWeights(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p,
-                                     double distTol, std::vector<double>& weights);
-    bool IsPointInVolumeCell(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, double distTol);
-    double DistanceToCellBoundary(const UnstructuredMesh::Pointer& mesh, igIndex cellId, const Point& p, Point& closest);
-
-    /* ---------------- 属性处理 ---------------- */
-    void InterpolatePointData(AttributeSet* inSet, AttributeSet::Pointer outSet,
-                              const std::vector<SampleLocation>& locations, int sampleNum);
-    void CopyCellData(AttributeSet* inSet, AttributeSet::Pointer outSet,
-                      const std::vector<SampleLocation>& locations, int sampleNum);
-    void AddValidPointMask(AttributeSet::Pointer outSet, int sampleNum);
+    // 定位 / 权重 / 属性插值全部由 ProbeFilter 采样内核完成（见 iGameProbeFilter.h）：
+    //   ProbeFilter::BuildSourceMesh / LocatePositions / InterpolateAttributes
+    // 本类只负责：沿线生成采样点、把内核结果整理成本类的查询接口、以及折线输出的构造。
 
     /* ---------------- 输出构建 ---------------- */
     void BuildPolyLineOutputs(const Points::Pointer& samples, AttributeSet::Pointer attrSet, int sampleNum);
