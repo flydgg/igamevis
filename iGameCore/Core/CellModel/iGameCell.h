@@ -257,9 +257,11 @@ public:
 		LagrangeShapeAndGradient1D(orderR, r, ll0, dd0);
 		LagrangeShapeAndGradient1D(orderS, s, ll1, dd1);
 
+		const bool wantDerivs = (derivs != nullptr);
 		double dv[512];
 		const auto put = [&](int pos, int i0, int i1) {
 			shape[pos] = ll0[i0] * ll1[i1];
+			if (!wantDerivs) { return; }
 			dv[2 * pos] = dd0[i0] * ll1[i1];
 			dv[2 * pos + 1] = ll0[i0] * dd1[i1];
 		};
@@ -284,11 +286,167 @@ public:
 			for (int j = 1; j < orderR; ++j) { put(sn++, j, i); }
 		}
 		const int n = sn;
-		for (int i = 0; i < n; ++i) {
-			derivs[i] = dv[2 * i];
-			derivs[n + i] = dv[2 * i + 1];
+		if (wantDerivs) {
+			for (int i = 0; i < n; ++i) {
+				derivs[i] = dv[2 * i];
+				derivs[n + i] = dv[2 * i + 1];
+			}
 		}
 		return n;
+	}
+
+	/**
+	 * 3D 六面体：等价 Tensor3ShapeFunctions / Tensor3ShapeDerivatives（节点序：
+	 * 8 角点 → 12 棱内部点 → 6 面内部点 → 体内部点）。
+	 * 导数输出为本仓库布局：前 n 项 ∂N/∂r，接着 n 项 ∂N/∂s，最后 n 项 ∂N/∂t。
+	 */
+	static int LagrangeTensor3(int orderR, int orderS, int orderT, double r, double s, double t,
+	                          double* shape, double* derivs) {
+		if (orderR < 1 || orderS < 1 || orderT < 1 || orderR > 9 || orderS > 9 || orderT > 9) { return 0; }
+		double ll0[10], ll1[10], ll2[10], dd0[10], dd1[10], dd2[10];
+		LagrangeShapeAndGradient1D(orderR, r, ll0, dd0);
+		LagrangeShapeAndGradient1D(orderS, s, ll1, dd1);
+		LagrangeShapeAndGradient1D(orderT, t, ll2, dd2);
+
+		const bool wantDerivs = (derivs != nullptr);
+		double dv[3072];
+		const auto put = [&](int pos, int i0, int i1, int i2) {
+			shape[pos] = ll0[i0] * ll1[i1] * ll2[i2];
+			if (!wantDerivs) { return; }
+			dv[3 * pos] = dd0[i0] * ll1[i1] * ll2[i2];
+			dv[3 * pos + 1] = ll0[i0] * dd1[i1] * ll2[i2];
+			dv[3 * pos + 2] = ll0[i0] * ll1[i1] * dd2[i2];
+		};
+
+		int sn = 0;
+		put(sn++, 0, 0, 0);
+		put(sn++, orderR, 0, 0);
+		put(sn++, orderR, orderS, 0);
+		put(sn++, 0, orderS, 0);
+		put(sn++, 0, 0, orderT);
+		put(sn++, orderR, 0, orderT);
+		put(sn++, orderR, orderS, orderT);
+		put(sn++, 0, orderS, orderT);
+
+		int sn1 = sn + (orderR + orderS - 2);
+		int sn2 = sn1 + (orderR + orderS - 2);
+		int sn3 = sn2 + (orderR + orderS - 2);
+		for (int i = 1; i < orderR; ++i) {
+			put(sn++, i, 0, 0);          // 棱 0-1
+			put(sn1++, i, orderS, 0);    // 棱 2-3
+			put(sn2++, i, 0, orderT);    // 棱 4-5
+			put(sn3++, i, orderS, orderT);// 棱 6-7
+		}
+		for (int i = 1; i < orderS; ++i) {
+			put(sn++, orderR, i, 0);          // 棱 1-2
+			put(sn1++, 0, i, 0);              // 棱 3-0
+			put(sn2++, orderR, i, orderT);    // 棱 5-6
+			put(sn3++, 0, i, orderT);         // 棱 7-4
+		}
+		sn = sn3;
+		sn1 = sn + (orderT - 1);
+		sn2 = sn1 + (orderT - 1);
+		sn3 = sn2 + (orderT - 1);
+		for (int i = 1; i < orderT; ++i) {
+			put(sn++, 0, 0, i);            // 棱 0-4
+			put(sn1++, orderR, 0, i);      // 棱 1-5
+			put(sn2++, orderR, orderS, i); // 棱 2-6
+			put(sn3++, 0, orderS, i);      // 棱 3-7
+		}
+		sn = sn3;
+		const int facePerT = (orderS - 1) * (orderT - 1);
+		sn1 = sn + facePerT;
+		sn2 = sn1 + facePerT;
+		sn3 = sn2 + facePerT;
+		for (int i = 1; i < orderT; ++i) {
+			for (int j = 1; j < orderS; ++j) {
+				put(sn++, 0, j, i);          // 面 0-4-7-3
+				put(sn1++, orderR, j, i);    // 面 1-2-6-5
+			}
+			for (int j = 1; j < orderR; ++j) {
+				put(sn2++, j, 0, i);         // 面 0-1-5-4
+				put(sn3++, j, orderS, i);    // 面 2-3-7-6
+			}
+		}
+		sn = sn3;
+		sn1 = sn + (orderR - 1) * (orderS - 1);
+		for (int i = 1; i < orderS; ++i) {
+			for (int j = 1; j < orderR; ++j) {
+				put(sn++, j, i, 0);          // 面 0-1-2-3
+				put(sn1++, j, i, orderT);    // 面 4-7-6-5
+			}
+		}
+		sn = sn1;
+		for (int k = 1; k < orderT; ++k) {
+			for (int j = 1; j < orderS; ++j) {
+				for (int i = 1; i < orderR; ++i) { put(sn++, i, j, k); }
+			}
+		}
+		const int n = sn;
+		if (wantDerivs) {
+			for (int i = 0; i < n; ++i) {
+				derivs[i] = dv[3 * i];
+				derivs[n + i] = dv[3 * i + 1];
+				derivs[2 * n + i] = dv[3 * i + 2];
+			}
+		}
+		return n;
+	}
+
+	/** 单纯形（三角形 / 四面体）基函数：等价 vtkHigherOrderTriangle::Eta */
+	static double SimplexEta(int n, int chi, double sigma) {
+		double result = 1.0;
+		for (int i = 1; i <= chi; ++i) { result *= (n * sigma - i + 1.0) / i; }
+		return result;
+	}
+
+	/** 单纯形基函数导数：等价 vtkHigherOrderTriangle::Deta */
+	static double SimplexDeta(int n, int chi, double sigma) {
+		if (chi == 0) { return 0.0; }
+		const double chiD = static_cast<double>(chi);
+		return (static_cast<double>(n) / chiD) * SimplexEta(n, chi - 1, sigma) +
+		       ((n * sigma - chiD + 1.0) / chiD) * SimplexDeta(n, chi - 1, sigma);
+	}
+
+	/** 三角形重心索引：等价 vtkHigherOrderTriangle::BarycentricIndex（index → 三重指数） */
+	static void SimplexBarycentricIndex(int index, int* bindex, int order) {
+		int maxV = order;
+		int minV = 0;
+		int ord = order;
+		while (index != 0 && index >= 3 * ord) {
+			index -= 3 * ord;
+			maxV -= 2;
+			++minV;
+			ord -= 3;
+		}
+		if (index < 3) {
+			bindex[index] = minV;
+			bindex[(index + 1) % 3] = minV;
+			bindex[(index + 2) % 3] = maxV;
+		} else {
+			index -= 3;
+			const int dim = index / (ord - 1);
+			const int offset = index - dim * (ord - 1);
+			bindex[(dim + 1) % 3] = minV;
+			bindex[(dim + 2) % 3] = (maxV - 1) - offset;
+			bindex[dim] = (minV + 1) + offset;
+		}
+	}
+
+	/** 三角形：由点数反推阶数（n = (p+1)(p+2)/2） */
+	static int TriangleOrderFromPointCount(int n) {
+		for (int p = 1; p <= 12; ++p) {
+			if ((p + 1) * (p + 2) / 2 == n) { return p; }
+		}
+		return -1;
+	}
+
+	/** 六面体：由点数反推阶数（n = (p+1)³） */
+	static int HexOrderFromPointCount(int n) {
+		for (int p = 1; p <= 9; ++p) {
+			if ((p + 1) * (p + 1) * (p + 1) == n) { return p; }
+		}
+		return -1;
 	}
 
 	/** 四边形：由点数反推阶数（n = (p+1)²，等价 VTK 的 GetNumberOfPoints 反推） */

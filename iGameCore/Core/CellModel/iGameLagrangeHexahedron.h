@@ -45,6 +45,45 @@ public:
     Cell* GetFace(const int faceId) override;
 
 
+    /* ---------------- VTK 风格插值接口（对照 vtkLagrangeHexahedron / vtkHigherOrderHexahedron） ----- */
+    int GetParametricDimension() const noexcept override { return 3; }
+
+    void GetParametricCenter(double pcoords[3]) const override {
+        pcoords[0] = 0.5;
+        pcoords[1] = 0.5;
+        pcoords[2] = 0.5;
+    }
+
+    int GetCellSize() const noexcept override {
+        const int n = static_cast<int>(this->m_Points->GetNumberOfPoints());
+        if (n > 0) { return n; }
+        return (m_Order > 0) ? ((m_Order + 1) * (m_Order + 1) * (m_Order + 1)) : 0;
+    }
+
+    int EffectiveOrder() const {
+        const int order = HexOrderFromPointCount(this->GetCellSize());
+        return (order > 0) ? order : m_Order;
+    }
+
+    void InterpolationFunctions(const double pcoords[3], double* weights) const override {
+        const int order = this->EffectiveOrder();
+        if (order < 1 || weights == nullptr) { return; }
+        LagrangeTensor3(order, order, order, pcoords[0], pcoords[1], pcoords[2], weights, nullptr);
+    }
+
+    void InterpolationDerivs(const double pcoords[3], double* derivs) const override {
+        const int order = this->EffectiveOrder();
+        if (order < 1 || derivs == nullptr) { return; }
+        double shape[1024];
+        LagrangeTensor3(order, order, order, pcoords[0], pcoords[1], pcoords[2], shape, derivs);
+    }
+
+    int EvaluatePosition(const Point& x, Point& closestPoint, int& subId, double pcoords[3],
+                         double& dist2, double* weights) const override {
+        // 形状函数 + 阻尼 Newton（与仓库二次体单元一致的约定；VTK 用线性子单元近似）
+        return this->EvaluatePositionNewton(x, closestPoint, subId, pcoords, dist2, weights);
+    }
+
     int GetEdgePointIds(const int edgeId, const igIndex*& ptIds) override {
 
         if (edgeId < 0 || edgeId >= 12) return 0;
