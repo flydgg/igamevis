@@ -151,5 +151,5 @@ Examples/Filter/TestResampleToLine.cpp
 2. 无效点的插值属性是 `0`，做统计前务必先用 `GetSampleValidMask()` / `GetValidPoints()` 过滤，否则 0 会混进结果；
 3. 手动容差是**相对值**（乘包围盒对角线），要绝对长度请用 `GetEffectiveTolerance()`；
 4. 输出折线的两个端点一定参与采样（与 VTK 一致），即使端点在模型之外；
-5. 「命中单元」走均匀网格加速，一次执行的采样点数 = `GetSampleNumber()`；点数很多时建议先裁剪输入模型；
+5. 定位走内核的 CSR 空间索引，采样点很多（≥1024）时自动按线程并行（结果与串行逐位一致）；一次执行的采样点数 = `GetSampleNumber()`；
 6. 输出几何是新建对象，不会修改输入模型。

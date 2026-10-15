@@ -53,9 +53,11 @@ IGAME_NAMESPACE_BEGIN
  *     （相对包围盒对角线）范围内存在单元，则把该点吸附到最近单元的边界最近点处取值，
  *     该采样点记为有效。对应 vtkProbeFilter 的 SnappingRadius；本实现不移动采样点坐标。
  *
- * 单元类型与插值方式沿用 ResampleToLine 的内核：线性面单元用线性插值（重心坐标 / 双线性 /
- * 扇形三角化），体单元用均值坐标（Mean Value Coordinates），二次/高次单元用二次形函数 +
- * 参数坐标 Newton 反解；未覆盖的高次单元退化为角点线性处理，并在 GetMessage() 中提示数量。
+ * 定位 / 权重 / 属性插值全部由 ProbeFilter 采样内核完成（本类不再自带任何几何判定或插值）：
+ *   ProbeFilter::BuildSourceMesh（源归一化）+ LocatePositions（CSR 空间索引 + 单元类型驱动定位）
+ *   + InterpolateAttributes（点数据插值 + 单元数据拷贝 + 掩膜）。
+ * 单元插值由各单元类型自己的 VTK 复刻实现给出（线性 10 类 + 二次 6 类 + PolyLine）；
+ * 尚未实现插值的类型退化为「前 N 个角点」的线性单元，数量在 GetMessage() 中提示。
  */
 class ResampleWithDataSet : public Filter {
 public:
