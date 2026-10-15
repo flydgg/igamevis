@@ -38,3 +38,4 @@
 CMakeUserPresets.json
 /Examples/Models/test/
 /Examples/Models/save_pv.cgns
+.DS_Store
