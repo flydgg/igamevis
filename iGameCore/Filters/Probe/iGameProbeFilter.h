@@ -92,6 +92,10 @@ public:
         bool snapToCellWithClosestPoint{false}; // 未命中时吸附到最近单元的最近点（VTK 默认关）
         double snappingRadius{-1.0};     // 吸附半径（绝对长度）；<0 = 不限（VTK 默认正无穷）
         std::string maskArrayName{"validpointmask"}; // 掩膜数组名；空串 = 不输出掩膜
+        // 采样点较多时按线程分块定位（等价 vtkProbeFilter 的 vtkSMPTools::For）。
+        // 结果与串行完全一致（lastCell 只是提示，命中判定与顺序无关）；源网格含需要面拓扑的
+        // Polyhedron 时自动退回串行。默认开启，样本数 < 1024 时仍走串行。
+        bool useParallel{true};
     };
 
     /**

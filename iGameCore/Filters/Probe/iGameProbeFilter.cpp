@@ -11,6 +11,7 @@
 // ============================================================================
 #include "iGameProbeFilter.h"
 
+#include <iGameThreadPool.h>
 #include <iGameAttributeSet.h>
 #include <iGameCellArray.h>
 #include <iGameCompositeDataObject.h>
@@ -134,7 +135,8 @@ void ComputeCellBox(const UnstructuredMesh::Pointer& mesh, igIndex cellId, doubl
 
 /** 建立 CSR 均匀网格（两遍：计数 → 前缀和 → 填充） */
 void BuildCellGrid(const UnstructuredMesh::Pointer& mesh, const BoundingBox& bbox, double tol,
-                   CellGrid& grid) {
+                   CellGrid& grid, bool& unsafeForParallel) {
+    unsafeForParallel = false;
     const igIndex cellNum = static_cast<igIndex>(mesh->GetNumberOfCells());
     if (cellNum <= 0) { return; }
 
@@ -171,6 +173,8 @@ void BuildCellGrid(const UnstructuredMesh::Pointer& mesh, const BoundingBox& bbo
     };
 
     for (igIndex cellId = 0; cellId < cellNum; ++cellId) {
+        // 需要面拓扑的单元（Polyhedron）只能用 mesh 的共享缓存单元对象 → 不适合并行
+        if (mesh->GetCellType(cellId) == IG_POLYHEDRON) { unsafeForParallel = true; }
         double* box = &grid.boxes[static_cast<size_t>(cellId) * 6];
         ComputeCellBox(mesh, cellId, tol, box);
         igIndex* range = &ranges[static_cast<size_t>(cellId) * 6];
@@ -343,10 +347,23 @@ Cell* MakeCellForType(IGenum type) {
     return (linear == IG_NONE) ? nullptr : NativeCellForType(linear);
 }
 
+/** 用网格单元的点填充内核自己的每线程单元对象（pointCount 个点） */
+void FillKernelCell(Cell* cell, const UnstructuredMesh::Pointer& mesh, const igIndex* ptIds, int pointCount) {
+    cell->Reset();
+    for (int i = 0; i < pointCount; ++i) {
+        const Point& p = mesh->GetPoint(ptIds[i]);
+        cell->m_Points->AddPoint(p[0], p[1], p[2]);
+        cell->m_PointIds->AddId(ptIds[i]);
+    }
+}
+
 /**
- * 取用于求值的单元对象：优先用单元类型自己的 VTK 插值实现；若该类型在 GetTypedCell 里
- * 没有对应单元类（拿到 EmptyCell），退化为「前 N 个角点」的线性单元（等价旧内核的角点
- * 线性退化，并在 SampleLocation::degraded 标记）。nptsOut 返回实际参与求值的点数。
+ * 取用于求值的单元对象：
+ *   1) 单元类型自己的 VTK 插值实现（**内核自己的每线程单元对象**，不共享 mesh 内部缓存，
+ *      因此可用在并行循环里）；
+ *   2) 需要面拓扑的类型（Polyhedron）：只能用 mesh 提供的单元对象（共享缓存，故不并行）；
+ *   3) 未实现插值的类型：退化为「前 N 个角点」的线性单元（等价旧内核的角点线性退化，
+ *      并在 SampleLocation::degraded 标记）。nptsOut 返回实际参与求值的点数。
  *
  * 注意：插值阶段（InterpolateAttributes）必须用同一个函数再取一次单元，才能保证
  * 权重与全局点 id 一一对应。
@@ -358,24 +375,32 @@ Cell* KernelCellFor(const UnstructuredMesh::Pointer& mesh, igIndex cellId, int& 
     nptsOut = npts;
     if (npts <= 0) { return nullptr; }
 
-    Cell* cell = mesh->GetCell(cellId);
-    if (cell != nullptr && cell->GetCellType() != IG_EMPTY_CELL) { return cell; }
-
     const IGenum type = mesh->GetCellType(cellId);
+
+    // 1) 原生类型：用内核每线程单元对象（固定点数类型用其常量点数；Polygon 等动态类型用实际点数）
+    if (Cell* native = NativeCellForType(type)) {
+        const int need = (native->GetCellSize() > 0) ? native->GetCellSize() : npts;
+        if (need > 0 && need <= npts) {
+            FillKernelCell(native, mesh, ptIds, need);
+            nptsOut = need;
+            return native;
+        }
+    }
+
+    // 2) 需要面拓扑的类型（Polyhedron）：沿用 mesh 内部构造好的单元对象
+    if (Cell* meshCell = mesh->GetCell(cellId); meshCell != nullptr && meshCell->GetCellType() != IG_EMPTY_CELL) {
+        return meshCell;
+    }
+
+    // 3) 退化：前 N 个角点的线性单元
     const IGenum linear = LinearTypeFor(type);
     Cell* fallback = (linear == IG_NONE) ? nullptr : NativeCellForType(linear);
-    if (fallback == nullptr) { return cell; }
+    if (fallback == nullptr) { return mesh->GetCell(cellId); }
 
-    // 固定点数类型返回常量（如 Hexahedron=8）；动态类型（Polygon）用退化后的实际点数
     const int corners = (fallback->GetCellSize() > 0) ? fallback->GetCellSize() : npts;
-    if (corners <= 0 || corners > npts) { return cell; }
+    if (corners <= 0 || corners > npts) { return mesh->GetCell(cellId); }
 
-    fallback->Reset();
-    for (int i = 0; i < corners; ++i) {
-        const Point& p = mesh->GetPoint(ptIds[i]);
-        fallback->m_Points->AddPoint(p[0], p[1], p[2]);
-        fallback->m_PointIds->AddId(ptIds[i]);
-    }
+    FillKernelCell(fallback, mesh, ptIds, corners);
     nptsOut = corners;
     if (degraded != nullptr) { *degraded = true; }
     return fallback;
@@ -877,14 +902,19 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
     const BoundingBox& bbox = mesh->GetBoundingBox();
 
     CellGrid grid;
-    BuildCellGrid(mesh, bbox, tol, grid);
+    bool unsafeForParallel = false;
+    BuildCellGrid(mesh, bbox, tol, grid, unsafeForParallel);
     ArrayObject* ghost = FindCellGhostArray(mesh->GetAttributeSet());
 
-    // 去重戳：环形扩张时同一单元可能落在多个体素里（等价 VTK 定位器内的候选去重）
-    std::vector<igIndex> stamp(mesh->GetNumberOfCells(), -1);
-    igIndex stampId = 0;
+    // 每个线程一份 scratch：去重戳（环形扩张时同一单元可能落在多个体素里，等价 VTK 定位器
+    // 内的候选去重）+ lastCell 提示（VTK 的 FindCell(x, lastCellId)）
+    struct LocateScratch {
+        std::vector<igIndex> stamp;
+        igIndex stampId{0};
+        igIndex lastCellId{-1};
+        explicit LocateScratch(size_t cellNum) : stamp(cellNum, -1) {}
+    };
 
-    igIndex lastCellId = -1;
     const igIndex cellNum = static_cast<igIndex>(mesh->GetNumberOfCells());
 
     // 源包围盒预判的余量：开启吸附时要按吸附半径放宽；吸附半径不限（<0）则不做预判
@@ -894,9 +924,13 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
                                                  : -1.0)
                                       : tol;
 
-    for (size_t i = 0; i < positions.size(); ++i) {
+    // 单点定位：结果与线程调度无关（lastCell 只是提示；命中判定与容差均与顺序无关）
+    const auto locateOne = [&](size_t i, LocateScratch& scratch) {
         const Point& p = positions[i];
         SampleLocation& loc = out[i];
+        igIndex& lastCellId = scratch.lastCellId;
+        std::vector<igIndex>& stamp = scratch.stamp;
+        igIndex& stampId = scratch.stampId;
 
         // 源包围盒（含余量）预判：域外点直接判无效（吸附不限半径时不做预判）
         if (bboxMargin >= 0.0) {
@@ -907,7 +941,7 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
                     outside = true;
                 }
             }
-            if (outside) { continue; }
+            if (outside) { return; } // lambda 顶层：域外直接返回（等价原来的 continue）
         }
 
         // 1) 上一个命中单元作为提示（VTK 的 FindCell(x, lastCellId)）
@@ -917,7 +951,7 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
             if (rc == 1) {
                 loc = hint;
                 if (validMask != nullptr) { (*validMask)[i] = 1; }
-                continue;
+                return; // 提示命中
             }
         }
 
@@ -1038,6 +1072,25 @@ bool ProbeFilter::LocatePositions(const UnstructuredMesh::Pointer& mesh,
         } else {
             lastCellId = -1;
         }
+    };
+
+    // 单位置循环；样本多且源网格可并行时按线程分块（每块独立 scratch，写 out 的互不相交下标）
+    const size_t sampleCount = positions.size();
+    constexpr size_t kParallelThreshold = 1024;
+    const bool parallel = options.useParallel && !unsafeForParallel && sampleCount >= kParallelThreshold;
+    if (parallel) {
+        const int maxThreads = std::max(1, ThreadPool::GetDefaultThreadCount());
+        ThreadPool::parallelFor(0, static_cast<int>(sampleCount), maxThreads,
+                                [&](int begin, int end, int id) {
+                                    LocateScratch scratch(static_cast<size_t>(cellNum));
+                                    (void) id;
+                                    for (int k = begin; k < end; ++k) {
+                                        locateOne(static_cast<size_t>(k), scratch);
+                                    }
+                                });
+    } else {
+        LocateScratch scratch(static_cast<size_t>(cellNum));
+        for (size_t i = 0; i < sampleCount; ++i) { locateOne(i, scratch); }
     }
     return true;
 }
