@@ -101,6 +101,8 @@ public:
 	int ReadCellsWithOffsetType(int& CellNum,ArrayObject::Pointer& CellsId, ArrayObject::Pointer& CellsConnect);
 	//read cells with offset type, that means cells load with cellsize and cell vert set
 	int ReadCellsWithCellSizeType(int CellNum,int size, ArrayObject::Pointer& CellsId, ArrayObject::Pointer& CellsConnect);
+	// 经典格式「CELLS n size」的二进制版本（大端 int32 连续块，一次读入再切分）
+	int ReadCellsWithCellSizeTypeBinary(int CellNum, int size, ArrayObject::Pointer& CellsId, ArrayObject::Pointer& CellsConnect);
 
 
 	bool ProcessMetaData();

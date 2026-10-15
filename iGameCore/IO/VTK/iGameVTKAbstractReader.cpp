@@ -1,5 +1,6 @@
-﻿#include "iGameVTKAbstractReader.h"
+#include "iGameVTKAbstractReader.h"
 #include "iGameByteSwap.h"
+#include <chrono>
 #include <vector>
 IGAME_NAMESPACE_BEGIN
 
@@ -177,17 +178,22 @@ int VTKAbstractReader::ReadPointCoordinates(Points::Pointer points, int PointsNu
         floatData = DynamicCast<FloatArray>(this->ReadArray("float", PointsNum, 3));
     }
     if (floatData != nullptr) {
-        //points->SetArray(data->RawPointer(), PointsNum);
-        float p[3]{};
-        for (int i = 0; i < PointsNum; i++) {
-            floatData->GetElement(i, p);
-            points->AddPoint(p);
+        // 批量写入：Points 的内存布局就是交错的 [x,y,z]×n（Vector3f），
+        // 源数组同布局，直接一次 memcpy，避免每点一次 AddPoint 调用。
+        points->SetNumberOfPoints(PointsNum);
+        const float* src = floatData->RawPointer();
+        float* dst = points->RawPointer();
+        if (src != nullptr && dst != nullptr) {
+            std::memcpy(dst, src, sizeof(float) * 3 * static_cast<size_t>(PointsNum));
         }
     } else if (doubleData != nullptr) {
-        float p[3]{};
-        for (int i = 0; i < PointsNum; i++) {
-            doubleData->GetElement(i, p);
-            points->AddPoint(p);
+        points->SetNumberOfPoints(PointsNum);
+        const double* src = doubleData->RawPointer();
+        float* dst = points->RawPointer();
+        if (src != nullptr && dst != nullptr) {
+            for (IGsize i = 0; i < static_cast<IGsize>(PointsNum) * 3; ++i) {
+                dst[i] = static_cast<float>(src[i]);
+            }
         }
     } else {
         return 0;
@@ -807,39 +813,120 @@ int VTKAbstractReader::ReadCellsWithOffsetType(int& CellsNum, ArrayObject::Point
     return 1;
 }
 
+namespace {
+/** 跳过 ASCII 空白后判断下一个 token 是否等于 kw（只读，不移动读取指针） */
+bool PeekTokenIs(const char* is, const char* end, const char* kw) {
+    if (is == nullptr || end == nullptr) { return false; }
+    while (is < end && (*is == ' ' || *is == '\t' || *is == '\n' || *is == '\r')) { ++is; }
+    for (const char* k = kw; *k != '\0'; ++k, ++is) {
+        if (is >= end) { return false; }
+        char c = *is;
+        if (c >= 'A' && c <= 'Z') { c = static_cast<char>(c - 'A' + 'a'); }
+        if (c != *k) { return false; }
+    }
+    return true;
+}
+} // namespace
+
 int VTKAbstractReader::ReadCellsWithCellSizeType(int CellNum, int size, ArrayObject::Pointer& CellsId,
                                                  ArrayObject::Pointer& CellsConnect) {
     auto m_CellsId = IntArray::New();
-    m_CellsId->Reserve(CellNum + 1);
+    m_CellsId->Resize(static_cast<IGsize>(CellNum) + 1);
+    int* ids = m_CellsId->RawPointer();
     auto m_CellsConnect = IntArray::New();
-    if (size > CellNum) { m_CellsConnect->Reserve(size - CellNum); }
+    const int connCapacity = (size > CellNum) ? (size - CellNum) : 0;
+    m_CellsConnect->Resize(static_cast<IGsize>(connCapacity));
+    int* conn = m_CellsConnect->RawPointer();
     int component, i, j;
-    int x;
     int index = 0;
     for (i = 0; i < CellNum; i++) {
-        m_CellsId->AddValue(index);
+        ids[i] = index;
         if (!this->Read(&component)) {
             igError("Cell id error!");
             return 0;
         }
-        index += component;
+        if (component < 0 || index + component > connCapacity) {
+            igError("Cell size mismatch!");
+            return 0;
+        }
         for (j = 0; j < component; j++) {
-            if (!this->Read(&x)) {
+            if (!this->Read(&conn[index + j])) {
                 igError("Cell id error!");
                 return 0;
             }
-            m_CellsConnect->AddValue(x);
         }
+        index += component;
     }
-    m_CellsId->AddValue(index);
+    ids[CellNum] = index;
+    m_CellsConnect->Resize(static_cast<IGsize>(index)); // 截断到实际连接数
     this->UpdateReadProgress();
     CellsId = m_CellsId;
     CellsConnect = m_CellsConnect;
     return 1;
 }
+
+//------------------------------------------------------------------------------
+// 经典格式「CELLS n size」的二进制版本：size 个大端 int32 连续存放（每单元 = 个数 + 点号）
+int VTKAbstractReader::ReadCellsWithCellSizeTypeBinary(int CellNum, int size, ArrayObject::Pointer& CellsId,
+                                                       ArrayObject::Pointer& CellsConnect) {
+    if (CellNum <= 0 || size <= 0) {
+        igError("Cell array header error!");
+        return 0;
+    }
+    const size_t want = sizeof(int) * static_cast<size_t>(size);
+    // FileReader::Read 在剩余数据不足时会静默截断，这里显式校验，避免用未初始化数据继续解析
+    if (this->IS == nullptr || this->FILEEND == nullptr ||
+        static_cast<size_t>(this->FILEEND - this->IS) < want) {
+        igError("Cell connectivity data truncated!");
+        return 0;
+    }
+    std::vector<int> buffer(static_cast<size_t>(size));
+    if (!this->Read(reinterpret_cast<char*>(buffer.data()), want)) {
+        igError("Cell connectivity data error!");
+        return 0;
+    }
+    // 经典 VTK 二进制文件固定大端
+    ByteSwap::Swap4BERange(buffer.data(), size);
+
+    auto ids = IntArray::New();
+    ids->Resize(static_cast<IGsize>(CellNum) + 1);
+    int* idsPtr = ids->RawPointer();
+    auto conn = IntArray::New();
+    conn->Resize(static_cast<IGsize>(size));
+    int* connPtr = conn->RawPointer();
+
+    int pos = 0;
+    int index = 0;
+    for (int i = 0; i < CellNum; ++i) {
+        if (pos >= size) {
+            igError("Cell connectivity truncated!");
+            return 0;
+        }
+        idsPtr[i] = index;
+        const int component = buffer[static_cast<size_t>(pos++)];
+        if (component < 0 || pos + component > size) {
+            igError("Cell connectivity size mismatch!");
+            return 0;
+        }
+        std::memcpy(connPtr + index, buffer.data() + pos, sizeof(int) * static_cast<size_t>(component));
+        pos += component;
+        index += component;
+    }
+    idsPtr[CellNum] = index;
+    conn->Resize(static_cast<IGsize>(index)); // 截断到实际连接数
+    this->UpdateReadProgress();
+    CellsId = ids;
+    CellsConnect = conn;
+    return 1;
+}
 bool VTKAbstractReader::ReadUnstructuredGrid() {
     if (m_UnstructuredMesh == nullptr) { m_UnstructuredMesh = UnstructuredMesh::New(); }
     this->m_DataObjectType = IG_UNSTRUCTURED_MESH;
+    // 分阶段计时：读取大网格时能直接看出时间花在哪一步（点/连接/建单元数组/属性）
+    const auto elapsedMs = [](const std::chrono::steady_clock::time_point& t0) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    double tPointsMs = 0.0, tCellsMs = 0.0, tBuildArraysMs = 0.0, tPointDataMs = 0.0, tCellDataMs = 0.0;
     char line[IGAME_CELL_MAX_SIZE];
     igIndex i = 0, PointsNum = 0, CellsNum = 0;
     igIndex npts, size = 0, ncells = 0;
@@ -859,26 +946,40 @@ bool VTKAbstractReader::ReadUnstructuredGrid() {
             }
             Points::Pointer points = Points::New();
             points->Reserve(npts);
+            const auto tPoints = std::chrono::steady_clock::now();
             if (!this->ReadPointCoordinates(points, npts)) { return false; }
+            tPointsMs += elapsedMs(tPoints);
             m_UnstructuredMesh->SetPoints(points);
         } else if (!strncmp(line, "cells", 5)) {
-            if (this->m_FileType == IGAME_BINARY) {
-                this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect);
-            } else { // ascii
-                const char* tmpIS = this->IS;
-                if (!(this->Read(&ncells) && this->Read(&size))) {
-                    igError("Cannot read cells!");
-                    return false;
-                }
-                this->SkipNullData();
-                if (strncmp(this->IS, "OFFSETS", 7) == 0) {
-                    this->IS = tmpIS;
-                    this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect);
-                } else {
-                    this->ReadCellsWithCellSizeType(ncells, size, CellsId, CellsConnect);
-                }
+            // 两种文件类型都要区分：新式「CELLS n size」+ OFFSETS/CONNECTIVITY 段，或经典
+            // 「CELLS n size」+ 连续数据（ASCII 文本 / 二进制大端 int32 块）。
+            // 原先二进制分支无条件走 OFFSETS，遇到经典二进制文件会报错甚至越界崩溃。
+            const auto tCells = std::chrono::steady_clock::now();
+            const char* tmpIS = this->IS;
+            if (!(this->Read(&ncells))) {
+                igError("Cannot read cells!");
+                return false;
             }
-            if (Types) { this->TransferVtkCellToiGameCell(CellsId, CellsConnect, Types); }
+            const bool offsetStyle = PeekTokenIs(this->IS, this->FILEEND, "offsets");
+            if (offsetStyle) {
+                this->IS = tmpIS; // ReadCellsWithOffsetType 期望从 "CELLS" 之后开始
+                if (!this->ReadCellsWithOffsetType(ncells, CellsId, CellsConnect)) { return false; }
+            } else if (!this->Read(&size)) {
+                igError("Cannot read cells!");
+                return false;
+            } else if (this->m_FileType == IGAME_BINARY) {
+                // 「CELLS n size」头之后是行尾空白，再往后才是二进制数据块
+                this->SkipNullData();
+                if (!this->ReadCellsWithCellSizeTypeBinary(ncells, size, CellsId, CellsConnect)) { return false; }
+            } else {
+                if (!this->ReadCellsWithCellSizeType(ncells, size, CellsId, CellsConnect)) { return false; }
+            }
+            tCellsMs += elapsedMs(tCells);
+            if (Types) {
+                const auto tBuild = std::chrono::steady_clock::now();
+                this->TransferVtkCellToiGameCell(CellsId, CellsConnect, Types);
+                tBuildArraysMs += elapsedMs(tBuild);
+            }
         } else if (!strncmp(line, "cell_types", 10)) {
             if (!this->Read(&ncells)) {
                 igError("Cannot read cell types!");
@@ -886,7 +987,11 @@ bool VTKAbstractReader::ReadUnstructuredGrid() {
             }
             Types = DynamicCast<IntArray>(this->ReadArray("int", ncells, 1));
             // Update the dataset
-            if (CellsId && CellsConnect) { this->TransferVtkCellToiGameCell(CellsId, CellsConnect, Types); }
+            if (CellsId && CellsConnect) {
+                const auto tBuild = std::chrono::steady_clock::now();
+                this->TransferVtkCellToiGameCell(CellsId, CellsConnect, Types);
+                tBuildArraysMs += elapsedMs(tBuild);
+            }
         } else if (!strncmp(line, "cell_data", 9)) {
             if (!this->Read(&CellsNum)) {
                 igError("Cannot read cell data!");
@@ -896,7 +1001,9 @@ bool VTKAbstractReader::ReadUnstructuredGrid() {
                 igError("Number of cells don't match!");
                 return false;
             }
+            const auto tCellData = std::chrono::steady_clock::now();
             this->ReadCellData(CellsNum);
+            tCellDataMs += elapsedMs(tCellData);
             break; // out of this loop
         }
 
@@ -909,7 +1016,9 @@ bool VTKAbstractReader::ReadUnstructuredGrid() {
                 igError("Number of points don't match!");
                 return false;
             }
+            const auto tPointData = std::chrono::steady_clock::now();
             this->ReadPointData(PointsNum);
+            tPointDataMs += elapsedMs(tPointData);
             break; // out of this loop
         } else if (!strncmp(line, "metadata", 8)) {
             this->ProcessMetaData();
@@ -918,6 +1027,9 @@ bool VTKAbstractReader::ReadUnstructuredGrid() {
             //return false;
         }
     }
+    igDebug("VTK unstructured grid phases: points={} ms, cells={} ms, buildCellArrays={} ms, "
+            "pointData={} ms, cellData={} ms",
+            tPointsMs, tCellsMs, tBuildArraysMs, tPointDataMs, tCellDataMs);
     return true;
 }
 
@@ -1185,21 +1297,39 @@ void VTKAbstractReader::TransferVtkCellToiGameCell(DataObject::Pointer& _mesh, A
     int normalizedCells = 0;
     bool onlyVertexCells = CellNum > 0 && mesh->GetNumberOfCells() == 0;
 
+    // 快路径：三个输入数组通常是 IntArray，取一次原始指针即可，避免每单元/每点一次虚函数调用
+    const int* idPtr = nullptr;
+    const int* connPtr = nullptr;
+    const int* typePtr = nullptr;
+    if (auto a = DynamicCast<IntArray>(CellsID); !a.IsNull()) { idPtr = a->RawPointer(); }
+    if (auto a = DynamicCast<IntArray>(CellsConnect); !a.IsNull()) { connPtr = a->RawPointer(); }
+    if (auto a = DynamicCast<IntArray>(VtkCellsType); !a.IsNull()) { typePtr = a->RawPointer(); }
+    const auto idAt = [&](int k) { return idPtr != nullptr ? idPtr[k] : static_cast<int>(CellsID->GetValue(k)); };
+    const auto connAt = [&](int k) {
+        return connPtr != nullptr ? connPtr[k] : static_cast<int>(CellsConnect->GetValue(k));
+    };
+    const auto typeAt = [&](int k) {
+        return typePtr != nullptr ? typePtr[k] : static_cast<int>(VtkCellsType->GetValue(k));
+    };
+
+    // 复用同一块缓冲：原先每个单元都构造一次 std::vector（百万单元即百万次堆分配）
+    std::vector<igIndex> vhs;
+
     for (int i = 0; i < CellNum; i++) {
         if (i + 1 >= offsetsCount) {
             skippedCells++;
             continue;
         }
 
-        const int st = static_cast<int>(CellsID->GetValue(i));
-        const int ed = static_cast<int>(CellsID->GetValue(i + 1));
+        const int st = idAt(i);
+        const int ed = idAt(i + 1);
         int size = ed - st;
         if (st < 0 || ed < st || ed > connectCount || size <= 0) {
             skippedCells++;
             continue;
         }
 
-        const VTKTYPE declaredType = (VTKTYPE) VtkCellsType->GetValue(i);
+        const VTKTYPE declaredType = (VTKTYPE) typeAt(i);
         onlyVertexCells &= declaredType == VERTEX;
         VTKTYPE type = NormalizeVtkCellType(declaredType, size);
         if (type != declaredType) normalizedCells++;
@@ -1208,10 +1338,10 @@ void VTKAbstractReader::TransferVtkCellToiGameCell(DataObject::Pointer& _mesh, A
             continue;
         }
 
-        std::vector<igIndex> vhs(size);
+        vhs.resize(static_cast<size_t>(size));
 
         if (type != POLYHEDRON) {
-            for (int j = 0; j < size; j++) { vhs[j] = static_cast<igIndex>(CellsConnect->GetValue(st + j)); }
+            for (int j = 0; j < size; j++) { vhs[j] = static_cast<igIndex>(connAt(st + j)); }
         } else {
             // for celltype == 42
             bool isValid = (FacesConnect && FacesConnect->GetNumberOfElements() > 0 && PolysOffset &&

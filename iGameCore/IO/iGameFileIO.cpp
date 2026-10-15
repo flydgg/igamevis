@@ -1,4 +1,6 @@
 #include "iGameFileIO.h"
+
+#include <chrono>
 #include "Spectral/iGameSpectralReaderCPU.h"
 #include "iGameDrawObject.h"
 
@@ -357,10 +359,10 @@ DataObject::Pointer FileIO::ReadFileWithRenderingPolicy(const std::string& file_
     std::string out;
     out.append("Read file [type: ");
     out.append(GetFileTypeAsString(fileType));
-    clock_t start, end;
+    const auto startTime = std::chrono::steady_clock::now();
     DataObject::Pointer resObj = nullptr;
 
-    start = clock();
+
     switch (fileType) {
         case SPECTRAL_DAT:
         case SPECTRAL_NEKTAR: {
@@ -546,11 +548,12 @@ DataObject::Pointer FileIO::ReadFileWithRenderingPolicy(const std::string& file_
     // CGNS groups X/Y/Z vector fields; numbered scalar arrays remain independent in vtkCGNSReader.
     resObj = FinalizeLoadedObject(resObj, baseName, fileType != CGNS);
 
-    end = clock();
+
     out.append(", success: ");
     out.append(resObj != nullptr ? "true" : "false");
     out.append(", time: ");
-    out.append(FormatTime(end - start));
+    out.append(FormatTime(static_cast<size_t>(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startTime).count())));
     out.append("]");
     igDebug(out);
     return resObj;
@@ -617,9 +620,9 @@ bool FileIO::WriteFile(const std::string& file_name, DataObject::Pointer dataObj
     std::string out;
     out.append("Write file [type: ");
     out.append(GetFileTypeAsString(fileType));
-    clock_t start, end;
+    const auto startTime = std::chrono::steady_clock::now();
     bool result = false;
-    start = clock();
+
     switch (fileType) {
         case NONE: {
             IGAME_CORE_ERROR("Not support write this type!");
@@ -711,11 +714,12 @@ bool FileIO::WriteFile(const std::string& file_name, DataObject::Pointer dataObj
             break;
     }
 
-    end = clock();
+
     out.append(", success: ");
     out.append(result ? "true" : "false");
     out.append(", time: ");
-    out.append(FormatTime(end - start));
+    out.append(FormatTime(static_cast<size_t>(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startTime).count())));
     out.append("]");
     //igDebug(out);
     IGAME_CORE_DEBUG("{}", out);

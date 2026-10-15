@@ -1,4 +1,6 @@
 #include "iGameFileReader.h"
+
+#include <chrono>
 #include "iGameByteSwap.h"
 #include "iGameFileSystem.h"
 #include "iGameStringArray.h"
@@ -37,17 +39,13 @@ bool FileReader::Execute() {
         }
     };
 
-    clock_t start, end;
-    start = clock();
+    const auto startTime = std::chrono::steady_clock::now();
 
-    clock_t time1 = clock();
     if (!Open()) {
         IGAME_CORE_ERROR("Opening failure");
         resetProgressUI();
         return false;
     }
-    clock_t time2 = clock();
-    //std::cout << "Read file to buffer Cost " << time2 - time1 << "ms\n";
     if (!Parsing()) {
         IGAME_CORE_ERROR("Parsing failure");
         resetProgressUI();
@@ -63,15 +61,15 @@ bool FileReader::Execute() {
         resetProgressUI();
         return false;
     }
-    clock_t time3 = clock();
 
     if (m_Output) {
         m_Output->GetProperties()->AddProperty(Variant::LongLong, "FileSize")->SetValue(static_cast<long long>(m_FileSize));
     }
     
     this->SetOutput(0, m_Output);
-    end = clock();
-    igDebug("Read file success! The time cost: {} ms", end - start);
+    const double elapsedMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - startTime).count();
+    igDebug("Read file success! The time cost: {} ms", elapsedMs);
 
     resetProgressUI();
     return true;
